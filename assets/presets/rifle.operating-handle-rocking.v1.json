@@ -1,0 +1,18 @@
+{
+    "format": 1,
+    "id": "rifle.operating-handle-rocking.v1",
+    "label": "Rifle — operating handle and rocking magazine",
+    "category": "Rifle",
+    "model": {
+        "feed": {
+            "container": "detachable", "magazineRelease": "manual",
+            "insertion": "native-curve",
+            "hands": [ "right", "left" ],
+            "loadingPoints": [ { "id": "magwell", "unit": "container", "destination": "container" } ]
+        },
+        "mechanisms": [
+            { "id": "handle", "kind": "operating-handle", "roles": [ "extract", "eject", "cock", "chamber" ], "return": "spring", "locksOpen": true }
+        ],
+        "fire": { "motion": "native-clip", "afterShot": "automatic-cycle", "ejection": "on-fire", "lockOpen": "handle" }
+    }
+}

@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "id": "shotgun.break-action.v1",
+  "label": "Break action - individual shell chambers",
+  "category": "Shotgun",
+  "model": {
+    "feed": {
+      "container": "fixed",
+      "magazineRelease": "none",
+      "hands": [
+        "left",
+        "right"
+      ],
+      "loadingPoints": [
+        {
+          "id": "chambers",
+          "unit": "round",
+          "destination": "container",
+          "requiresOpen": "barrels"
+        }
+      ],
+      "insertion": "straight"
+    },
+    "mechanisms": [
+      {
+        "id": "barrels",
+        "kind": "hinge",
+        "roles": [
+          "eject",
+          "open-access"
+        ],
+        "return": "stays"
+      }
+    ],
+    "fire": {
+      "motion": "native-clip",
+      "afterShot": "automatic-cycle",
+      "ejection": "on-opening",
+      "lockOpen": ""
+    }
+  }
+}

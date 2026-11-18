@@ -1,0 +1,201 @@
+"""Finished-pack validation and stable local object-plugin generation.
+
+Native plugin and NIF operations are delegated to the bundled approved adapters.
+An atomic current.json selects a complete generation, including its ID ledger.
+"""
+import copy
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+
+import yaml
+
+TEMPLATES = {
+    'sniper.manual-bolt-fixed.v1',
+    'shotgun.pump-tube.v1',
+    'rifle.lever-tube.v1',
+    'energy.manual-cell.v1',
+    'energy.cell-lever.v1',
+    'revolver.double-action-speedloader.v1',
+    'shotgun.break-action.v1',
+    'rifle.hk-slap-detachable.v1', 'rifle.hk-slap-catch-detachable.v1', 'rifle.aug-locking-handle.v1', 'rifle.open-bolt-handle-detachable.v1',
+    'pistol.slide-detachable.v1',
+    'rifle.ar15-detachable.v1',
+    'rifle.operating-handle-rocking.v1',
+    'rifle.reciprocating-detachable.v1', 'rifle.reciprocating-manual-detachable.v1',
+    'sniper.manual-bolt-detachable.v1',
+    'rifle.ar15-stroke-detachable.v1',
+    'rifle.independent-handle-rocking.v1',
+    'rifle.reciprocating-rocking.v1',
+    'rifle.rotary-handle-detachable.v1',
+    'shotgun.self-loading-detachable.v1', 'shotgun.self-loading-tube.v1',
+}
+
+
+def require(condition, reason):
+    if not condition:
+        raise ValueError(reason)
+
+
+def cancellation():
+    marker = os.environ.get('RELOAD_MAKER_CANCEL_FILE')
+    if marker and Path(marker).exists():
+        raise RuntimeError('Build cancelled; the last good generation was retained')
+
+
+def digest(file):
+    with file.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def read(file, limit=None):
+    require(file.is_file(), f'Missing file: {file}')
+    # Expanded source-driven profiles can exceed metadata-sized budgets.
+    # Only callers reading a specifically bounded metadata format set a limit.
+    if limit is not None:
+        require(file.stat().st_size <= limit, f'Oversized file: {file}')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, f'Duplicate JSON key: {key}')
+            result[key] = value
+        return result
+    return json.loads(file.read_text(encoding='utf-8'), object_pairs_hook=unique,
+                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f'Nonfinite JSON: {value}')))
+
+
+def write(file, value, *, compact=False):
+    file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = file.with_name(file.name+'.pending')
+    temporary.write_text(json.dumps(value, sort_keys=True, indent=None if compact else 2,
+                                   separators=(',', ':') if compact else None, allow_nan=False)+'\n', encoding='utf-8')
+    os.replace(temporary, file)
+
+
+def relative(value):
+    require(isinstance(value, str) and 0 < len(value) < 512, 'Invalid relative content path')
+    value = value.replace('\\', '/')
+    path = PurePosixPath(value)
+    require(not path.is_absolute() and all(p not in ('', '.', '..') and ':' not in p for p in value.split('/')), f'Unsafe content path: {value}')
+    return value
+
+
+def within(root, value):
+    file = (root/relative(value)).resolve()
+    require(file.is_relative_to(root.resolve()), f'Content escapes pack: {value}')
+    return file
+
+
+def identity(value):
+    require(isinstance(value, str) and re.fullmatch(r'[a-z0-9][a-z0-9._/-]{0,199}', value) is not None and '..' not in value, 'Invalid logical identity')
+    return value
+
+
+def load_pack(root, manifest_path=None):
+    root = root.resolve()
+    manifest_path=manifest_path or root/'manifest.json'
+    if not manifest_path.is_file():
+        manifests=list(root.glob('F4SE/Plugins/DIAMOND/Packs/*/manifest.json'))
+        require(len(manifests)==1, 'Select a folder containing one complete reload pack')
+        manifest_path=manifests[0]
+    manifest = read(manifest_path, 1024*1024)
+    require(manifest.get('format') == 'diamond-content-pack' and manifest.get('version') == 1, 'Unsupported content pack')
+    pack = identity(manifest.get('id'))
+    require('/' not in pack, 'Pack ID must be a single namespace')
+    require(isinstance(manifest.get('revision'), int) and manifest['revision'] > 0, 'Missing pack revision')
+    required = manifest.get('templates')
+    require(isinstance(required, list) and required and all(t in TEMPLATES for t in required), f'Unsupported template in {pack}')
+    weapons = manifest.get('weapons')
+    require(isinstance(weapons, list) and weapons and all(isinstance(w,dict) for w in weapons),
+            'A finished reload pack needs weapon behavior, hand fits, sounds and grab policies; object-only packs are incomplete')
+    files = manifest.get('files')
+    require(isinstance(files, list) and 0 < len(files) <= 10000, 'Export this pack again: its file list is missing or from an older Maker')
+    mesh_prefix = 'meshes/'+Path(manifest['generatedPlugin']).stem.lower()+'/' if manifest.get('generatedPlugin') else f'meshes/diamond/packs/{pack}/'
+    overrides = {relative(p).casefold() for p in manifest.get('modelOverrides', [])}
+    require(all(p.startswith('meshes/') and p.endswith('.nif') for p in overrides), 'Invalid weapon model override')
+    normalized = set()
+    for path in files:
+        key = relative(path).casefold()
+        require(key not in normalized, 'Case-ambiguous pack file')
+        require(key.startswith(f'f4se/plugins/diamond/packs/{pack}/') or key.startswith(mesh_prefix) or key in overrides,
+                f'Pack file is outside its namespace: {path}')
+        require(within(root, path).is_file(), f'Pack file is missing: {path}')
+        normalized.add(key)
+    objects_path = relative(manifest.get('objects'))
+    require(objects_path in files, 'Object definitions are not frozen in the pack')
+    objects = read(within(root, objects_path), 8*1024*1024)
+    require(isinstance(objects, list) and 0 < len(objects) <= 2048, 'Invalid object count')
+    ids = set()
+    for obj in objects:
+        key = identity(obj.get('id'))
+        require(key.startswith(pack+'/') and key not in ids, 'Duplicate or foreign object identity')
+        ids.add(key)
+        model = relative(obj.get('model'))
+        require(model.casefold().startswith(mesh_prefix) and model.casefold().endswith('.nif'), 'Object model is outside its pack namespace')
+        require(model in files, 'Object model is not a frozen finished asset')
+        bounds = obj.get('bounds')
+        require(isinstance(bounds, list) and len(bounds) == 6 and all(type(v) is int and -32768 <= v <= 32767 for v in bounds), 'Invalid object bounds')
+        require(all(bounds[i] < bounds[i+3] for i in range(3)), 'Empty object bounds')
+        require(isinstance(obj.get('name'), str) and 0 < len(obj['name']) <= 256, 'Invalid object name')
+        require(type(obj.get('weight')) in (int, float) and math.isfinite(obj['weight']) and 0 <= obj['weight'] < 10000, 'Invalid inventory weight')
+        require(type(obj.get('value')) is int and 0 <= obj['value'] <= 0x7fffffff, 'Invalid inventory value')
+    return dict(root=root, manifestPath=manifest_path, manifest=manifest, objects=objects)
+
+
+def allocate(previous, packs):
+    ledger = copy.deepcopy(previous)
+    require(ledger.get('version') == 1 and str(ledger.get('plugin','')).lower().endswith('.esp'), 'Invalid installation ledger')
+    entries = ledger.get('objects')
+    require(isinstance(entries, dict) and len(entries) <= 8192, 'Invalid installation object count')
+    used = set()
+    for key, entry in entries.items():
+        identity(key)
+        value = entry.get('localId')
+        require(type(value) is int and 0x800 <= value <= 0xfff and value not in used, 'Corrupt or duplicate object allocation')
+        used.add(value)
+        entries[key] = dict(localId=value, active=False)
+    next_id = ledger.get('nextId')
+    require(type(next_id) is int and next_id > max(used, default=0x7ff) and next_id <= 0x1000, 'Invalid ledger high-water mark')
+    active = set()
+    for pack in sorted(packs, key=lambda p: p['manifest']['id']):
+        for obj in sorted(pack['objects'], key=lambda o: o['id']):
+            key = obj['id']
+            require(key not in active, 'Two active packs define the same object')
+            active.add(key)
+            if key not in entries:
+                require(next_id <= 0xfff and len(entries) < 8192, 'Generated object allocation is full')
+                entries[key] = dict(localId=next_id)
+                next_id += 1
+            entries[key].update(definition=obj, active=True, pack=pack['manifest']['id'])
+    ledger['nextId'] = next_id
+    return ledger
+
+
+def write_plugin_source(folder, ledger):
+    folder.mkdir(parents=True)
+    plugin = ledger['plugin']
+    masters = ledger['masters']
+    header = dict(SpriggitSource=dict(PackageName='Spriggit.Yaml.Fallout4', Version='0.40'),
+                  ModKey=plugin, GameRelease='Fallout4VR',
+                  ModHeader=dict(Flags=['Small'], Stats=dict(Version=.95, NextFormID=ledger['nextId']),
+                                 Author='Reload Maker', Description='Generated physical reload objects.',
+                                 MasterReferences=[dict(Master=master, FileSize=0) for master in masters], INTV='0x01000000'))
+    (folder/'RecordData.yaml').write_text(yaml.safe_dump(header, sort_keys=False), encoding='utf-8')
+    write(folder/'spriggit-meta.json', dict(PackageName='Spriggit.Yaml.Fallout4', Version='0.40', Release='Fallout4VR', ModKey=plugin))
+    records = folder/'MiscItems'
+    records.mkdir()
+    for key, entry in ledger['objects'].items():
+        if not entry['active']:
+            continue
+        obj = entry['definition']
+        editor = 'DiamondObject_'+hashlib.sha256(key.encode()).hexdigest()[:24]
+        entry['editorId'] = editor
+        record = dict(FormKey=f'{entry["localId"]:06X}:{plugin}', EditorID=editor,
+                      ObjectBounds=dict(First=', '.join(map(str, obj['bounds'][:3])), Second=', '.join(map(str, obj['bounds'][3:]))),
+                      Name=dict(TargetLanguage='English', Value=obj['name']),
+                      Model=dict(File=relative(obj['model'])[7:].replace('/', '\\'), Data='0x0400000000000000000000000000000000000000'),
+                      Value=obj['value'], Weight=obj['weight'])
+        (records/(editor+'.yaml')).write_text(yaml.safe_dump(record, sort_keys=False), encoding='utf-8')

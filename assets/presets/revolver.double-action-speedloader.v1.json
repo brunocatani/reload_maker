@@ -1,0 +1,42 @@
+{
+  "format": 1,
+  "id": "revolver.double-action-speedloader.v1",
+  "label": "Revolver - double action with speedloader",
+  "category": "Pistol",
+  "model": {
+    "feed": {
+      "container": "fixed",
+      "magazineRelease": "mechanism",
+      "hands": [
+        "left",
+        "right"
+      ],
+      "loadingPoints": [
+        {
+          "id": "cylinder-load",
+          "unit": "clip",
+          "destination": "container",
+          "requiresOpen": "crane"
+        }
+      ],
+      "insertion": "native-curve"
+    },
+    "mechanisms": [
+      {
+        "id": "crane",
+        "kind": "crane",
+        "roles": [
+          "eject",
+          "open-access"
+        ],
+        "return": "stays"
+      }
+    ],
+    "fire": {
+      "motion": "native-clip",
+      "afterShot": "automatic-cycle",
+      "ejection": "on-opening",
+      "lockOpen": ""
+    }
+  }
+}

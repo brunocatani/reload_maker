@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "id": "shotgun.pump-tube.v1",
+  "label": "Shotgun — manual pump, bottom-loaded tube",
+  "category": "Shotgun",
+  "model": {
+    "feed": {
+      "container": "fixed", "magazineRelease": "none",
+      "loadingPoints": [{"id": "tube-port", "unit": "round", "destination": "container", "requiresOpen": "pump"}]
+    },
+    "mechanisms": [{"id": "pump", "kind": "pump", "roles": ["extract", "eject", "cock", "chamber"], "return": "stays"}],
+    "fire": {"motion": "nothing", "afterShot": "manual-cycle", "ejection": "on-manual-cycle", "manualCycle": "pump"}
+  }
+}

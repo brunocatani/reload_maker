@@ -1,0 +1,55 @@
+#include "MagazineSetup.h"
+#include <QJsonArray>
+#include <QRegularExpression>
+#include <QUuid>
+#include <cmath>
+namespace reloadmaker {
+bool readMagazineSetup(const QJsonObject& json,MagazineSetup& out,QString& error) {
+    const auto fail=[&](const char* why){error=why;return false;};MagazineSetup value;
+    if(json["version"]!=1)return fail("Unsupported magazine presentation");
+    if(json.contains("trackAnchors")&&(!json["trackAnchors"].isArray()||json["trackAnchors"].toArray().size()>maximumReloadTracks))return fail("Invalid magazine track nodes");
+    value.recipeId=json["recipeId"].toString();value.trackAnchors=json["trackAnchors"].toArray();value.motion=json["motion"].toString();
+    value.sourceClip=json["sourceClip"].toString();value.sourceBaseline=json["sourceBaseline"].toString();
+    if(value.sourceClip.isEmpty()!=value.sourceBaseline.isEmpty()||value.sourceClip.size()>512||value.sourceBaseline.size()>512)return fail("Choose both insertion and baseline clips");
+    if(value.motion!="preset"&&value.motion!="linear"&&value.motion!="native"&&value.motion!="manual")return fail("Choose source behavior, linear extraction, native insertion or a saved movement");
+    if(value.motion=="manual") {value.movementId=json["movementId"].toString();if(QUuid(value.movementId).isNull())return fail("Choose a saved magazine movement");}
+    const auto integer=[](QJsonValue v,int high){return v.isDouble()&&v.toDouble()==std::floor(v.toDouble())&&v.toInt(-1)>=0&&v.toInt(high)<high;};
+    if(!integer(json["emptyTrack"],maximumReloadTracks)||!integer(json["loadedFrame"],maximumReloadFrames)||!integer(json["emptyFrame"],maximumReloadFrames))return fail("Select the empty body and payload samples");
+    value.emptyTrack=json["emptyTrack"].toInt();value.loadedFrame=json["loadedFrame"].toInt();value.emptyFrame=json["emptyFrame"].toInt();
+    if(!json["sampledPayload"].isBool())return fail("Choose whether payload uses captured source frames");value.sampledPayload=json["sampledPayload"].toBool();
+    if(!json["entrySeconds"].isDouble()||!std::isfinite(json["entrySeconds"].toDouble())||json["entrySeconds"].toDouble()<0||json["entrySeconds"].toDouble()>120)return fail("Invalid native magazine entry time");
+    value.entrySeconds=float(json["entrySeconds"].toDouble());
+    if(json.contains("seatSeconds")){value.seatSeconds=float(json["seatSeconds"].toDouble(-1));if(!std::isfinite(value.seatSeconds)||value.seatSeconds<0||value.seatSeconds>120)return fail("Invalid round seating time");}
+    if(json.contains("chambers")) {
+        const auto chambers=json["chambers"].toArray();if(chambers.size()>8)return fail("Too many physical chambers");
+        for(const auto& item:chambers) {
+            const auto chamber=item.toObject();const int track=chamber["track"].toInt(-1);const double seconds=chamber["seatSeconds"].toDouble(-1);
+            if(!integer(chamber["track"],maximumReloadTracks)||!std::isfinite(seconds)||seconds<0||seconds>120)return fail("Select a chamber part and its seated source time");
+            for(const auto& previous:value.chambers)if(previous.track==track)return fail("A chamber part is selected twice");
+            value.chambers.append({track,float(seconds)});
+        }
+    }
+    if(json.contains("loadingFollowers")){
+        const auto followers=json["loadingFollowers"].toArray();if(followers.size()>16)return fail("Too many loading followers");
+        for(const auto& track:followers){if(!integer(track,maximumReloadTracks)||value.loadingFollowers.contains(track.toInt()))return fail("Select distinct loading parts");value.loadingFollowers.append(track.toInt());}
+    }
+    if(!json["pieces"].isArray()||json["pieces"].toArray().isEmpty()||json["pieces"].toArray().size()>256)return fail("Review the native magazine pieces before saving");
+    for(const auto& item:json["pieces"].toArray()) {
+        const auto row=item.toObject();const auto path=row["path"].toString(),role=row["role"].toString();
+        if(path.isEmpty()||path.size()>4096||value.pieces.contains(path)||(role!="body"&&role!="cartridge"&&role!="spare"))return fail("Each native magazine piece needs a unique path and explicit role");
+        value.pieces[path]=role;
+    }
+    out=value;error.clear();return true;
+}
+QJsonObject magazineSetupJson(const MagazineSetup& value) {
+    QJsonArray pieces;for(auto it=value.pieces.cbegin();it!=value.pieces.cend();++it)pieces.append(QJsonObject{{"path",it.key()},{"role",it.value()}});
+    QJsonObject result{{"version",1},{"recipeId",value.recipeId},{"motion",value.motion},{"emptyTrack",value.emptyTrack},{"loadedFrame",value.loadedFrame},
+        {"emptyFrame",value.emptyFrame},{"sampledPayload",value.sampledPayload},{"entrySeconds",value.entrySeconds},{"pieces",pieces}};
+    if(!value.loadingFollowers.isEmpty()){QJsonArray followers;for(int track:value.loadingFollowers)followers.append(track);result["loadingFollowers"]=followers;}
+    if(value.seatSeconds>=0)result["seatSeconds"]=value.seatSeconds;
+    if(!value.chambers.isEmpty()){QJsonArray chambers;for(const auto& chamber:value.chambers)chambers.append(QJsonObject{{"track",chamber.track},{"seatSeconds",chamber.seatSeconds}});result["chambers"]=chambers;}
+    if(!value.sourceClip.isEmpty()){result["sourceClip"]=value.sourceClip;result["sourceBaseline"]=value.sourceBaseline;}
+    if(!value.trackAnchors.isEmpty())result["trackAnchors"]=value.trackAnchors;
+    if(value.motion=="manual")result["movementId"]=value.movementId;return result;
+}
+}

@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "adapters": {
+    "nif": {
+      "source": "nif_mcp/server.py",
+      "sourceSha256": "18de6c5f3ae4b69eb49afe9e93695b40e06290d2f798e92492c9cd1a84805d9f",
+      "changes": [
+        "Resolve installed tools only through the product launcher",
+        "Use configured Creation Kit only"
+      ]
+    },
+    "plugin": {
+      "source": "fo4_mcp/server.py",
+      "sourceSha256": "25d28ce947161783608daf3c3063e44c1f987fe74e4cdc4212f0dbc8150e8acb",
+      "changes": [
+        "Resolve installed tools only through the product launcher",
+        "Use configured Creation Kit only"
+      ]
+    },
+    "archive": {
+      "source": "bsa_mcp/server.py",
+      "sourceSha256": "488ab294fd70211dbb737080e08f05a7b9b29692bc239e09b5acc644103f2b17",
+      "changes": [
+        "Resolve installed tools only through the product launcher",
+        "Use configured Creation Kit only"
+      ]
+    }
+  },
+  "nativeComponents": {
+    "NifSkope": {
+      "license": "See bundled LICENSE.txt and component source notices"
+    },
+    "BSA Browser CLI": {
+      "license": "Bundled dependency notices; main CLI redistribution/source audit pending"
+    },
+    "Spriggit Fallout4 serializer": {
+      "version": "0.40",
+      "license": "Installed package metadata; complete notice/source audit pending"
+    },
+    "Python": {
+      "version": "3.14.3",
+      "license": "Bundled LICENSE.txt and package dist-info licenses"
+    },
+    "DIAMOND content validator": {
+      "source": "DIAMOND/tools/ProfileCheck.cpp and DiamondProfile",
+      "purpose": "Uses the runtime parsers before complete pack publication",
+      "license": "Project source; distribution license review pending"
+    }
+  },
+  "publicationReady": false,
+  "templates": {
+    "assets/empty-world.nif": {
+      "sha256": "63dd49a921415f23fd6b52c8b5b0d78488209228d38c517905d2e36ffd1064f6",
+      "contract": "One identity NiNode, FO4 stream 130; no geometry, materials, skin or physics",
+      "origin": "Existing generated empty DIAMOND world-model template, verified through nif_mcp"
+    }
+  }
+}

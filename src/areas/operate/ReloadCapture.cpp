@@ -1,0 +1,408 @@
+// Learning the weapon's base reload: the recipe Operate and the reload page
+// work from. The clip is sampled at 120 Hz; every animated weapon part with
+// a hand anchor becomes a track of weapon-local poses. Sampling runs in
+// batches on a zero-interval timer so the window stays responsive.
+#include "ReloadMakerController.h"
+#include "StudioWindow.h"
+#include "glview.h"
+#include "gl/glshape.h"
+#include "model/nifmodel.h"
+#include "ReloadGraph.h"
+#include "areas/operate/WeaponLocalSampler.h"
+#include "commands/CommandSupport.h"
+#include <QJsonDocument>
+
+#include <QComboBox>
+#include <QJsonArray>
+#include <QLabel>
+#include <QProgressBar>
+#include <QPushButton>
+#include <QSet>
+#include <QTabWidget>
+#include <QTimer>
+#include <algorithm>
+#include <cmath>
+
+namespace reloadmaker
+{
+    namespace
+    {
+        constexpr float kCaptureSamplesPerSecond = 120.0f;
+        // Frames sampled per timer tick.
+        constexpr int kCaptureBatchFrames = 16;
+    }
+
+    // Drops the recipe and any capture in progress, and the simulation built on it.
+    void ReloadMakerController::invalidateReloadCapture()
+    {
+        stopSimulation();
+        _simulationRig.reset();
+        _simulationAmmo = {};
+        _simulation.configureAmmunition(0, false);
+        if (_reloadCaptureTimer) {
+            _reloadCaptureTimer->stop();
+        }
+        if (_reloadPreviewTimer) {
+            _reloadPreviewTimer->stop();
+        }
+        // The graph keeps a pointer to the recipe; detach it before the recipe goes.
+        if (_reloadGraph) {
+            _reloadGraph->setRecipe(nullptr);
+        }
+        _reloadRecipe.reset();
+        _reloadTrackNodes.clear();
+        _reloadClip = {};
+        _reloadBase.clear();
+        _reloadExpectedPath.clear();
+        _reloadCapturing = false;
+        _reloadPlaying = false;
+        resetReloadPage();
+    }
+
+    // Selects the base reload on the timeline and starts learning it. A
+    // recipe already learned from the same clip is kept.
+    void ReloadMakerController::startReloadCapture()
+    {
+        _reloadCaptureQueued = false;
+        if (!reloadCaptureAllowed() || _loadThread || _rebuildTimer->isActive() || _reloadCapturing) {
+            return;
+        }
+        const auto action = std::find_if(_animationActions.cbegin(), _animationActions.cend(), [](const auto& a) { return a.baseReload; });
+        if (action == _animationActions.cend() || _nodeBindings.isEmpty() || _renderedWeapon != _selectedWeapon) {
+            _reloadSummary->setText("This configuration has no resolved base WPNReload. No fire, charge, unload or alternative clip will be substituted.");
+            return;
+        }
+        const auto expected = action->resourcePath;
+        // Operate only consumes the recipe and must not have its active clip
+        // replaced when the recipe is already current.
+        if (!_reloadWorkspaceActive && _reloadRecipe && _reloadExpectedPath == expected) {
+            return;
+        }
+        const int actionRow = actionIndex(expected);
+        if (actionRow < 0) {
+            return;
+        }
+        if (_workspace == GripsWorkspace && _handEditorPage == HandEditorPage::GrabLocations) {
+            _grabLocationCapturePreview = std::pair{ _activeAnimationPath, _playbackTime };
+        }
+        selectAction(actionRow);
+        if (!_clip.valid() || _activeAnimationPath != expected) {
+            return;
+        }
+        if (_reloadRecipe && _reloadExpectedPath == expected) {
+            showReloadRecipe();
+            seekReload(_playbackTime);
+            return;
+        }
+        invalidateReloadCapture();
+        _reloadExpectedPath = expected;
+        _reloadClip = _clip;
+        _reloadBase = _stateBaselineLocalPose;
+        ReloadRecipe recipe;
+        QString error;
+        bool read = false;
+        {
+            StageClock clock(_loadTimings, "reload.read");
+            read = readReloadSource(expected, recipe, error) && addReloadTracks(recipe, error);
+        }
+        if (!read) {
+            setStatus(error, true);
+            return;
+        }
+        _reloadRecipe = std::move(recipe);
+        _captureSampleKey.clear();
+        if(_saveAll&&!_geometrySignature.isEmpty()) {
+            QJsonArray baseline,bindings,nodes;
+            for(const auto& pose:_reloadBase)baseline.append(commands::transformJson(pose));
+            for(const auto& track:_reloadRecipe->tracks)bindings.append(QJsonObject{{"model",track.anchor.ownerModel},
+                {"path",track.anchor.anchorPath},{"parent",track.parent},{"surface",track.surface}});
+            for(const auto& node:_assemblyNodes)nodes.append(QJsonObject{{"parent",node.parent},{"bone",node.boneIndex},
+                {"alignment",node.alignmentNode},{"rest",commands::transformJson(node.restLocal)}});
+            _captureSampleKey=QString::fromUtf8(QJsonDocument(QJsonObject{{"geometry",_geometrySignature},
+                {"clip",expected},{"baselineClip",_stateBaselineAnimationPath},{"baseline",baseline},{"bindings",bindings},
+                {"nodes",nodes},{"frames",_reloadRecipe->frames},{"duration",_reloadRecipe->duration}}).toJson(QJsonDocument::Compact));
+        }
+        _reloadCaptureClock.start();
+        _reloadSamplingMilliseconds = 0;
+        _reloadCaptureFrame = 0;
+        _reloadCapturing = true;
+        if(_saveAll&&!_captureSampleKey.isEmpty()) {
+            const auto cached=_saveAll->samples.constFind(_captureSampleKey);
+            if(cached!=_saveAll->samples.cend()&&cached->clip==_captureClipBytes&&cached->baseline==_captureBaselineBytes&&cached->poses.size()==_reloadRecipe->tracks.size()) {
+                for(int i=0;i<cached->poses.size();++i)_reloadRecipe->tracks[i].poses=cached->poses[i];
+                ++_saveAll->sampleCacheHits;
+                finishReloadCapture(error);
+                return;
+            }
+        }
+        showReloadCaptureStarted(expected);
+        _reloadCaptureTimer->start();
+    }
+
+    // Reads the reload clip and its baseline, samples the baseline's first
+    // frame as the reload base, and fills the recipe's timing and source
+    // identity. On failure `error` holds the user-facing message.
+    bool ReloadMakerController::readReloadSource(const QString& expected, ReloadRecipe& recipe, QString& error)
+    {
+        const auto clipBytes = readAnimationResource(expected, error);
+        if (clipBytes.isEmpty()) {
+            return false;
+        }
+        const auto baseBytes = readAnimationResource(_stateBaselineAnimationPath, error);
+        if (baseBytes.isEmpty()) {
+            return false;
+        }
+        _captureClipBytes=clipBytes;_captureBaselineBytes=baseBytes;
+        // Analyze and display the same bytes whose identity we persist, even if
+        // the user replaced the loose clip since the normal preview cached it.
+        const auto sourceClip = HkxReader::readClip(clipBytes, error);
+        const auto sourceBase = HkxReader::readClip(baseBytes, error);
+        QVector<Transformf> sourceTracks;
+        QVector<Transformf> baseGlobal;
+        if (!sourceClip.valid() || !sourceBase.valid() ||
+            !samplePose(_skeleton, sourceBase, 0, sourceBase.additive ? &_readyLocalPose : nullptr, sourceTracks, _reloadBase, baseGlobal, error)) {
+            error = "Cannot sample the resolved reload source: " + error;
+            return false;
+        }
+        _reloadClip = sourceClip;
+        _clip = sourceClip;
+        _stateBaselineLocalPose = _reloadBase;
+        recipe.duration = sourceClip.durationSeconds;
+        if (!std::isfinite(recipe.duration) || recipe.duration <= 0 || recipe.duration * kCaptureSamplesPerSecond > maximumReloadFrames - 1) {
+            error = "Reload exceeds the supported 120 Hz analysis duration; no frames were silently dropped.";
+            return false;
+        }
+        recipe.frames = int(std::ceil(recipe.duration * kCaptureSamplesPerSecond)) + 1;
+        QJsonArray mods;
+        for (const auto* mod : configuredObjectMods()) {
+            mods.append(QJsonObject{ { "record", poseRecordKey(mod->formId) }, { "model", mod->modelPath } });
+        }
+        recipe.source = {
+            { "action", "WPNReload" },
+            { "weaponRecord", poseRecordKey(currentWeapon()->formId) },
+            { "baseModel", currentWeapon()->baseModelPath },
+            { "mods", mods },
+            { "animation", expected },
+            { "baseline", _stateBaselineAnimationPath },
+        };
+        return true;
+    }
+
+    // One track per bound weapon part that has an animated-part hand anchor.
+    // A track is a grab surface when the part draws geometry; its parent is
+    // the track of its semantic parent binding.
+    bool ReloadMakerController::addReloadTracks(ReloadRecipe& recipe, QString& error)
+    {
+        if (!compileMechanismScene(_assemblyNodes, _nodeBindings, {}, _reloadScenePlan, error)) {
+            return false;
+        }
+        const QSet<int> geometry = weaponGeometryBlocks();
+        auto* model = activeModel();
+        QVector<int> bindingIndices;
+        for (int i = 0; i < _nodeBindings.size(); ++i) {
+            const auto& binding = _nodeBindings[i];
+            if (!binding.weaponPart) {
+                continue;
+            }
+            int anchor = -1;
+            for (int a = 1; a < _handPoseAnchors.size(); ++a) {
+                if (_handPoseAnchors[a].node == _sceneNodes[binding.nodeIndex] && _handPoseAnchors[a].description.anchorKind == "animated-part") {
+                    anchor = a;
+                    break;
+                }
+            }
+            if (anchor < 0) {
+                continue;
+            }
+            ReloadTrack track;
+            track.anchor = _handPoseAnchors[anchor].description;
+            track.label = _handPoseAnchors[anchor].label;
+            track.surface = geometry.contains(model->getBlockNumber(_sceneNodes[binding.nodeIndex]));
+            // Equivalent named helper copies can remain in source NIFs. Keep
+            // the one that owns visible geometry; an unused duplicate must
+            // not manufacture a second physical part in the captured recipe.
+            int duplicate=-1;
+            for(int previous=0;previous<recipe.tracks.size();++previous)if(sameGripAnchor(track.anchor,recipe.tracks[previous].anchor)){duplicate=previous;break;}
+            if(duplicate>=0){
+                if(!track.surface)continue;
+                if(!recipe.tracks[duplicate].surface){recipe.tracks[duplicate]=track;_reloadTrackNodes[duplicate]=binding.nodeIndex;bindingIndices[duplicate]=i;continue;}
+            }
+            track.poses.reserve(recipe.frames);
+            recipe.tracks.append(std::move(track));
+            _reloadTrackNodes.append(binding.nodeIndex);
+            bindingIndices.append(i);
+        }
+        if (recipe.tracks.isEmpty() || recipe.tracks.size() > maximumReloadTracks) {
+            error = "No supported concrete animated-part tracks, or too many tracks for this capture.";
+            return false;
+        }
+        for (int i = 0; i < bindingIndices.size(); ++i) {
+            recipe.tracks[i].parent = bindingIndices.indexOf(_nodeBindings[bindingIndices[i]].semanticParentBinding);
+        }
+        // Static source parts are sampled by the scene plan too. They have no
+        // skeleton binding; authoring supplies their motion after capture.
+        const int boundTrackCount = recipe.tracks.size();
+        for (const auto& anchor : _handPoseAnchors) {
+            if (anchor.description.anchorKind != "animated-part") {
+                continue;
+            }
+            const int node = _sceneNodes.indexOf(anchor.node);
+            if (node < 0 || _auxiliaryReloadNodes.contains(node) || _assemblyNodes[node].boneIndex >= 0 || _reloadTrackNodes.contains(node)) {
+                continue;
+            }
+            ReloadTrack track;
+            track.anchor = anchor.description;
+            track.label = anchor.label + QStringLiteral(" · static source");
+            track.surface = geometry.contains(model->getBlockNumber(anchor.node));
+            track.poses.reserve(recipe.frames);
+            recipe.tracks.append(std::move(track));
+            _reloadTrackNodes.append(node);
+        }
+        if (recipe.tracks.size() > maximumReloadTracks) {
+            error = "Too many source part tracks for this capture.";
+            return false;
+        }
+        for (int i = boundTrackCount; i < recipe.tracks.size(); ++i) {
+            int parent = _assemblyNodes[_reloadTrackNodes[i]].parent;
+            for (int depth = 0; parent >= 0 && depth < _assemblyNodes.size(); ++depth) {
+                const int track = _reloadTrackNodes.indexOf(parent);
+                if (track >= 0) {
+                    recipe.tracks[i].parent = track;
+                    break;
+                }
+                parent = _assemblyNodes[parent].parent;
+            }
+        }
+        return true;
+    }
+
+    // Blocks that draw the weapon's geometry: for each shape under the weapon
+    // or an attached part, its skin bones, or its node ancestry when unskinned.
+    QSet<int> ReloadMakerController::weaponGeometryBlocks() const
+    {
+        QSet<int> geometry;
+        auto* model = activeModel();
+        auto* scene = _window->getGLView()->getScene();
+        for (auto* shape : scene->shapes) {
+            if (!shape) {
+                continue;
+            }
+            auto node = model->getBlockIndex(shape->id());
+            bool weapon = false;
+            QVector<int> ancestors;
+            for (int depth = 0; node.isValid() && depth < model->getBlockCount(); ++depth) {
+                ancestors.append(model->getBlockNumber(node));
+                if (node == _weaponRoot) {
+                    weapon = true;
+                }
+                for (const auto& root : _partRoots) {
+                    if (root == node) {
+                        weapon = true;
+                    }
+                }
+                node = model->getBlockIndex(model->getParent(node));
+            }
+            if (!weapon) {
+                continue;
+            }
+            const auto skin = shape->reloadMakerSkinBones();
+            if (skin.isEmpty()) {
+                for (const int block : ancestors) {
+                    geometry.insert(block);
+                }
+            } else {
+                for (const int bone : skin) {
+                    geometry.insert(bone);
+                }
+            }
+        }
+        return geometry;
+    }
+
+    // Capture timer tick: samples the next batch of frames, then finishes.
+    void ReloadMakerController::advanceReloadCapture()
+    {
+        if (!_reloadCapturing || !_reloadRecipe || !reloadCaptureAllowed() || _loadThread || _rebuildTimer->isActive()) {
+            invalidateReloadCapture();
+            return;
+        }
+        QString error;
+        QElapsedTimer batchClock;
+        batchClock.start();
+        WeaponLocalSampler sampler(_skeleton, _nodeBindings, _reloadScenePlan, _weaponBoneIndex);
+        sampler.setBaseline(_reloadBase);
+        auto& recipe = *_reloadRecipe;
+        for (int batch = 0; batch < kCaptureBatchFrames && _reloadCaptureFrame < recipe.frames; ++batch, ++_reloadCaptureFrame) {
+            const float seconds = recipe.duration * _reloadCaptureFrame / (recipe.frames - 1);
+            if (!sampler.sample(_reloadClip, seconds, error)) {
+                invalidateReloadCapture();
+                setStatus("Reload capture failed: " + error, true);
+                return;
+            }
+            if (!sampler.weaponFrameValid()) {
+                invalidateReloadCapture();
+                setStatus("Reload Weapon frame cannot be inverted", true);
+                return;
+            }
+            for (int i = 0; i < recipe.tracks.size(); ++i) {
+                recipe.tracks[i].poses.append(sampler.nodePose(_reloadTrackNodes[i]));
+            }
+        }
+        _reloadSamplingMilliseconds += batchClock.elapsed();
+        _reloadProgress->setValue(_reloadCaptureFrame);
+        if (_reloadCaptureFrame < recipe.frames) {
+            return;
+        }
+        finishReloadCapture(error);
+    }
+
+    // Gives the learned reload its identity and shows it. Then the waiting
+    // workspace continues.
+    void ReloadMakerController::finishReloadCapture(QString& error)
+    {
+        auto& recipe = *_reloadRecipe;
+        _loadTimings.add(QStringLiteral("reload.capture"), _reloadCaptureClock.elapsed());
+        _loadTimings.add(QStringLiteral("reload.sampling"), _reloadSamplingMilliseconds);
+        _reloadCaptureTimer->stop();
+        _reloadCapturing = false;
+        _reloadProgress->hide();
+        _reloadAnalyze->setEnabled(true);
+        bool identified = false;
+        {
+            StageClock clock(_loadTimings, "reload.identify");
+            identified = identifyReloadRecipe(recipe, error);
+        }
+        if (!identified) {
+            invalidateReloadCapture();
+            setStatus("Reload capture is invalid: " + error, true);
+            return;
+        }
+        if(_saveAll&&!_captureSampleKey.isEmpty()&&(!_saveAll->samples.contains(_captureSampleKey)||
+            _saveAll->samples.value(_captureSampleKey).clip!=_captureClipBytes||_saveAll->samples.value(_captureSampleKey).baseline!=_captureBaselineBytes)) {
+            SaveAllJob::Samples samples;samples.clip=_captureClipBytes;samples.baseline=_captureBaselineBytes;
+            for(const auto& track:recipe.tracks)samples.poses.append(track.poses);
+            _saveAll->samples.insert(_captureSampleKey,std::move(samples));
+        }
+        showReloadRecipe();
+        if (_reloadWorkspaceActive) {
+            seekReload(0);
+        }
+        if (simulationWorkspace(_workspace)) {
+            prepareSimulation();
+        } else if (_workspace == GripsWorkspace && _handEditorPage == HandEditorPage::GrabLocations) {
+            // Learning establishes live part bindings without replacing the
+            // frame the user chose for surface picking.
+            if (_grabLocationCapturePreview) {
+                const auto [path, seconds] = *_grabLocationCapturePreview;
+                _grabLocationCapturePreview.reset();
+                if (const int i = actionIndex(path); i >= 0) {
+                    selectAction(i);
+                    _playbackTime = std::clamp(seconds, 0.f, playbackDuration());
+                    (void)applyPose(_playbackTime);
+                    updateTimelineText();
+                }
+            }
+            prepareGrabLocationFrame();
+        }
+    }
+}

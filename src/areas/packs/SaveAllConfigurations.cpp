@@ -1,0 +1,206 @@
+// Capturing all of a weapon's configurations (rework 06) for the ESP save.
+// Each of the weapon's receiver × operating part × magazine choices is
+// selected with the loadout's own code, prepared in Operate and captured as
+// its runtime configuration. A configuration that cannot be prepared or
+// captured becomes an exception that names its parts and the reason. It never
+// stops the others. The save (EspProject.cpp) commits the captures.
+#include "ReloadMakerController.h"
+#include "StudioPaths.h"
+#include "commands/CommandSupport.h"
+
+#include <QDir>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QSaveFile>
+#include <QTimer>
+
+#include <algorithm>
+
+namespace reloadmaker
+{
+    using commands::require;
+
+    namespace
+    {
+        // How long the job waits before looking again while the assembly is busy.
+        constexpr int kPollMilliseconds = 15;
+    }
+
+    bool ReloadMakerController::assemblyBusy() const
+    {
+        return _loadThread || _reloadCapturing || _reloadCaptureQueued || _rebuildTimer->isActive();
+    }
+
+    // Receiver outermost, so it changes least: every choice of the receiver's
+    // slot, then of the operating part's slot when that part is separate, then
+    // of the magazine's slot. Parts the source policy blocks are left out. A
+    // fixed receiver or operating part, or a magazine built into the receiver,
+    // adds no choices.
+    ReloadMakerController::ConfigurationPlan ReloadMakerController::saveAllPlan(bool magazineOnly) const
+    {
+        const auto* config = configuration();
+        QSet<QString> blocked;
+        for (const auto& value : sourcePolicyState()["policy"].toObject()["blockedMods"].toArray()) {
+            blocked.insert(value.toString().toLower());
+        }
+        const auto axes = reloadAxes();
+        ConfigurationPlan plan{ {} };
+        for (const auto& [role, slot] : axes) {
+            const auto* entry = config->slot(slot);
+            ConfigurationPlan expanded;
+            for (const auto& partial : plan) {
+                const auto choices=magazineOnly&&role!=ConfigurationRole::Magazine?QVector<std::uint32_t>{config->selected(slot)}:
+                    entry?entry->choices:QVector<std::uint32_t>{};
+                for (const auto id : choices) {
+                    if (!config->mod(id) || blocked.contains(poseRecordKey(id).toLower())) {
+                        continue;
+                    }
+                    auto combination = partial;
+                    combination.append({ role, slot, id });
+                    expanded.append(combination);
+                }
+            }
+            plan = expanded;
+        }
+        if (plan.size() == 1 && plan.front().isEmpty()) {
+            plan.clear();
+        }
+        return plan;
+    }
+
+    // One step: wait for the assembly, select the next combination, or
+    // capture the selected one.
+    void ReloadMakerController::continueSaveAll()
+    {
+        if (!_saveAll) {
+            return;
+        }
+        auto& job = *_saveAll;
+        if (assemblyBusy()) {
+            QTimer::singleShot(kPollMilliseconds, this, [this] { continueSaveAll(); });
+            return;
+        }
+        if (job.cancelled || job.next >= job.plan.size()) {
+            finishSaveAll();
+            return;
+        }
+        const auto combination = job.plan[job.next];
+        if (!job.assembled) {
+            job.assembled = true;
+            try {
+                bool changed = false;
+                for (const auto& choice : combination) {
+                    if (configuration()->selected(choice.slot) != choice.mod) {
+                        changed |= configuration()->select(choice.slot, choice.mod);
+                    }
+                }
+                if (changed) {
+                    refreshAttachments();
+                    rebuildWeapon();
+                }
+            } catch (const std::exception& error) {
+                // The capture step reports the configuration as an exception.
+                setStatus(QString::fromUtf8(error.what()), true);
+            }
+        } else {
+            captureSaveAllConfiguration(combination);
+            job.assembled = false;
+            ++job.next;
+            _packJob["configuration"] = job.next;
+            _packJob["configurations"] = job.plan.size();
+            emit packJobChanged();
+        }
+        QTimer::singleShot(0, this, [this] { continueSaveAll(); });
+    }
+
+    // Prepares the selected combination in Operate, checks that the assembly
+    // uses the planned parts and writes the capture. Choices that assemble
+    // the same configuration (every magazine of a receiver with a built-in
+    // one) are captured once.
+    void ReloadMakerController::captureSaveAllConfiguration(const QVector<ConfigurationChoice>& combination)
+    {
+        auto& job = *_saveAll;
+        QJsonArray parts;
+        for (const auto& choice : combination) {
+            const auto* mod = configuration()->mod(choice.mod);
+            parts.append(QJsonObject{ { "role", configurationRoleName(choice.role) },
+                                      { "slot", QString::number(choice.slot) },
+                                      { "record", poseRecordKey(choice.mod) },
+                                      { "name", mod ? mod->name : QString() } });
+        }
+        try {
+            runSimulationAction(QStringLiteral("reset"));
+            require(_simulationActive, _simulationError.isEmpty() ? QStringLiteral("Operate could not prepare this configuration") : _simulationError);
+            job.status = mergedWeaponStatus(job.status);
+            const auto capture = exportRuntimeConfiguration();
+            const auto selection = capture["selection"].toObject();
+            QStringList key;
+            for (const auto* role : { "receiver", "magazine", "operatingPart" }) {
+                key.append(selection.value(QLatin1String(role)).toString().toLower());
+            }
+            for (const auto& choice : combination) {
+                const auto record = poseRecordKey(choice.mod).toLower();
+                const bool used = std::any_of(selection.begin(), selection.end(), [&](const QJsonValue& value) { return value.toString().toLower() == record; });
+                const bool builtIn = choice.role == ConfigurationRole::Magazine && magazineBuiltIn();
+                require(used || builtIn, "This assembly does not take " + configuration()->mod(choice.mod)->name);
+            }
+            if (job.captured.contains(key.join('|'))) {
+                return;
+            }
+            QSaveFile file(job.folder + QString("/%1.json").arg(job.captures, 4, 10, QChar('0')));
+            const auto bytes = QJsonDocument(capture).toJson();
+            require(file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit(), "Cannot write the capture");
+            job.captured.insert(key.join('|'));
+            ++job.captures;
+        } catch (const std::exception& error) {
+            job.exceptions.append(QJsonObject{ { "status", "failed" }, { "parts", parts }, { "error", QString::fromUtf8(error.what()) },
+                {"preparation",QJsonObject{{"workspace",_workspace},{"recipe",_reloadRecipe.has_value()},
+                    {"rig",_simulationRig.has_value()},{"simulationError",_simulationError},{"lastError",_lastError}}} });
+        }
+    }
+
+    // Restores the author's selection, then hands the captures to the save.
+    void ReloadMakerController::finishSaveAll()
+    {
+        auto job = std::move(*_saveAll);
+        _saveAll.reset();
+        bool changed = false;
+        for (auto it = job.original.cbegin(); it != job.original.cend(); ++it) {
+            if (configuration() && configuration()->selected(it.key()) != it.value()) {
+                changed |= configuration()->select(it.key(), it.value());
+            }
+        }
+        if (changed) {
+            refreshAttachments();
+            rebuildWeapon();
+        }
+        if (job.finished) {
+            job.finished(job);
+        }
+    }
+
+    // Selects the parts named by records, for opening a reported
+    // configuration. Records not offered by any slot are left out.
+    bool ReloadMakerController::selectConfigurationRecords(const QStringList& records)
+    {
+        auto* config = configuration();
+        if (!config || assemblyBusy() || _saveAll) {
+            return false;
+        }
+        bool changed = false;
+        for (const auto& record : records) {
+            for (const auto& slot : config->entries()) {
+                for (const auto id : slot.choices) {
+                    if (poseRecordKey(id).compare(record, Qt::CaseInsensitive) == 0 && config->selected(slot.key) != id) {
+                        changed |= config->select(slot.key, id);
+                    }
+                }
+            }
+        }
+        if (changed) {
+            refreshAttachments();
+            rebuildWeapon();
+        }
+        return changed;
+    }
+}

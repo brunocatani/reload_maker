@@ -1,0 +1,196 @@
+#include "ReloadMakerController.h"
+#include "InstallationSetup.h"
+#include "StudioWindow.h"
+#include "glview.h"
+#include "gl/glshape.h"
+#include "model/nifmodel.h"
+#include "physics-interaction/weapon/authored/HoldingGripMath.h"
+#include <QQuaternion>
+#include <QJsonArray>
+#include <QDir>
+#include <QJsonDocument>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QFileDialog>
+#include <QDialog>
+#include <QFormLayout>
+#include <QVBoxLayout>
+#include <QPushButton>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QLabel>
+#include <QUuid>
+#include <QDateTime>
+namespace reloadmaker {
+namespace {
+namespace hm=rock::holding_grip_math;
+hm::Pose mathPose(const Transformf& t){hm::Pose p;const auto m=QQuaternion(t.rotation.w,t.rotation.x,t.rotation.y,t.rotation.z).toRotationMatrix();for(int i=0;i<3;++i)for(int j=0;j<3;++j)p.r[i*3+j]=m(i,j);p.t={t.translation.x,t.translation.y,t.translation.z};p.s=t.scale.x;return p;}
+Transformf previewPose(const hm::Pose& p){QMatrix3x3 m;for(int i=0;i<3;++i)for(int j=0;j<3;++j)m(i,j)=p.r[i*3+j];const auto q=QQuaternion::fromRotationMatrix(m).normalized();return {{p.t[0],p.t[1],p.t[2]},{q.x(),q.y(),q.z(),q.scalar()},{p.s,p.s,p.s}};}
+QJsonObject jsonPose(const Transformf& t){const auto p=mathPose(t);QJsonArray r,a;for(auto x:p.r)r.append(x);for(auto x:p.t)a.append(x);return {{"rotate",r},{"translate",a},{"scale",p.s}};}
+Transformf readPose(const QJsonValue& value){const auto j=value.toObject();const auto r=j["rotate"].toArray(),t=j["translate"].toArray();if(r.size()!=9||t.size()!=3||!j["scale"].isDouble())throw std::runtime_error("Invalid holding pose");hm::Pose p;for(int i=0;i<9;++i){if(!r[i].isDouble())throw std::runtime_error("Holding rotation entries must be numbers");p.r[i]=float(r[i].toDouble());}for(int i=0;i<3;++i){if(!t[i].isDouble())throw std::runtime_error("Holding translation entries must be numbers");p.t[i]=float(t[i].toDouble());}p.s=float(j["scale"].toDouble());if(!hm::valid(p))throw std::runtime_error("Holding pose must be finite with a proper rotation and positive scale");return previewPose(p);}
+QJsonObject poseRecord(const HandPose& p){QJsonArray fingers;for(const auto& f:p.fingers)fingers.append(jsonPose(f));return {{"wrist",jsonPose(p.placement.handInWeapon)},{"fingers",fingers},{"hand",p.hand==PoseHand::Left?"left":"right"}};}
+void readRecord(const QJsonObject& j,HandPose& p){p.placement.handInWeapon=p.placement.handInAnchor=readPose(j["wrist"]);const auto fingers=j["fingers"].toArray();if(fingers.size()!=15)throw std::runtime_error("A holding grip needs fifteen finger locals");for(int i=0;i<15;++i)p.fingers[i]=readPose(fingers[i]);}
+}
+QString ReloadMakerController::holdingGripVariant() const {
+ auto* model=activeModel();if(!model)return {};for(int i=0;i<_sceneNodes.size();++i)if(_sceneNodes[i].isValid()&&model->get<QString>(_sceneNodes[i],"Name")=="P-Grip")for(int j=0;j<_assemblyNodes.size();++j)if(_assemblyNodes[j].parent==i&&_sceneNodes[j].isValid())return model->get<QString>(_sceneNodes[j],"Name");if(currentWeapon()&&_holdingCapture.value("weapon").toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)==0)return _holdingCapture.value("gripNode").toString();return {};
+}
+QString ReloadMakerController::holdingGripKey(PoseHand hand,bool specific) const {const auto weapon=currentWeapon()?poseRecordKey(currentWeapon()->formId).toLower():QString();const bool pa=_holdingCapture.value("weapon").toString().compare(weapon,Qt::CaseInsensitive)==0&&_holdingCapture.value("powerArmor").toBool();return weapon+'|'+(specific?holdingGripVariant():QString())+'|'+(pa?"pa|":"normal|")+(hand==PoseHand::Left?"left":"right");}
+QJsonObject ReloadMakerController::holdingGripsState() const {
+ QJsonObject out{{"enabled",_holdingPreview},{"hand",_holdingHand==PoseHand::Left?"left":"right"},{"support",_holdingSupport},{"editing",_holdingEditing},{"replay",_holdingReplay},{"specific",_holdingSpecific},{"gripNode",holdingGripVariant()},{"error",_holdingError},{"calibrated",_holdingCapture.contains("rightBoneInWand")&&_holdingCapture.contains("leftBoneInWand")},{"capture",_holdingCapture},{"grips",_holdingGrips}};
+ out["sourceMirrorPlaneX"]=_holdingMirrorPlaneX;out["sourceMirrorPlaneAvailable"]=_holdingMirrorPlaneReady;
+ QJsonObject drafts=_holdingWorking;if(_holdingEditing&&_partGripDraft){auto pose=_partGripDraft->pose;pose.placement.handInWeapon=pose.placement.handInAnchor;if(_fingerDrafts[int(pose.hand)])pose.fingers=_fingerDrafts[int(pose.hand)]->fingers;drafts[holdingGripKey(pose.hand,_holdingSpecific)]=poseRecord(pose);}out["drafts"]=drafts;
+ if(_holdingPreview&&_holdingError.isEmpty()){
+  const auto expected=_holdingCapture.value(_holdingHand==PoseHand::Left?"renderedLeft":"renderedRight").toObject();
+  if(!_holdingReplay&&!expected.isEmpty()&&currentWeapon()&&_holdingCapture.value("weapon").toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)==0&&_holdingCapture.value("holdingHand")==(_holdingHand==PoseHand::Left?"left":"right"))try{const auto a=mathPose(_holdingSolved[int(_holdingHand)].placement.handInWeapon),b=mathPose(readPose(expected["wrist"]));float distance=0,rotation=0;for(int i=0;i<3;++i)distance+=(a.t[i]-b.t[i])*(a.t[i]-b.t[i]);for(int i=0;i<9;++i)rotation=std::max(rotation,std::abs(a.r[i]-b.r[i]));out["wristDifferenceGameUnits"]=std::sqrt(distance);out["rotationMatrixDifference"]=rotation;float trace=0;for(int i=0;i<9;++i)trace+=a.r[i]*b.r[i];out["wristAngleDegrees"]=std::acos(std::clamp((trace-1)*.5f,-1.f,1.f))*57.295779513;}catch(const std::exception&){}
+  out["left"]=poseRecord(_holdingSolved[0]);out["right"]=poseRecord(_holdingSolved[1]);}return out;
+}
+float ReloadMakerController::holdingMirrorPlaneX(){
+ if(_holdingMirrorPlaneReady)return _holdingMirrorPlaneX;
+ auto* model=activeModel();if(!model)return 0;
+ Transformf weapon;QString error;bool found=false;
+ for(const auto& binding:_nodeBindings)if(binding.boneIndex==_weaponBoneIndex){found=sceneNodeWorld(_sceneNodes[binding.nodeIndex],weapon,error);break;}
+ if(!found)return 0;
+ const auto inverse=hm::inverse(mathPose(weapon));
+ std::array<hm::PlaneEvidence,128> evidence{};std::size_t count=0;
+ for(int block=0;block<model->getBlockCount()&&count<evidence.size();++block){
+  const auto shape=model->getBlockIndex(block);
+  if(!model->blockInherits(shape,"BSTriShape")||model->getLink(shape,"Skin")>=0)continue;
+  QModelIndex owner;QStringList path;findShapeOwner(shape,_weaponRoot,owner,path);
+  if(!owner.isValid())continue;
+  const auto vertices=model->getIndex(shape,"Vertex Data");const int size=model->rowCount(vertices);if(!size)continue;
+  Transformf world;if(!sceneNodeWorld(shape,world,error))continue;
+  const auto transform=hm::compose(inverse,mathPose(world));hm::V low{},high{};bool first=true;
+  const int step=std::max(1,(size+8191)/8192);
+  for(int row=0;row<size;row+=step){const auto v=model->get<Vector3>(model->getIndex(vertices,row),"Vertex");const auto point=hm::point(transform,{v[0],v[1],v[2]});if(first){low=high=point;first=false;}else for(int a=0;a<3;++a){low[a]=std::min(low[a],point[a]);high[a]=std::max(high[a],point[a]);}}
+  evidence[count++]=hm::planeEvidence(low,high);
+ }
+ if(count){_holdingMirrorPlaneX=hm::geometryPlane(std::span(evidence.data(),count));_holdingMirrorPlaneReady=true;}
+ return _holdingMirrorPlaneX;
+}
+bool ReloadMakerController::applyHoldingPreview(){
+ if(auto* b=_window->findChild<QPushButton*>("HoldingGripButton"))b->setText(_holdingPreview?(_holdingHand==PoseHand::Left?"Holding: Left":"Holding: Right"):"Holding grip");
+ if(!_holdingPreview||_reloadCapturing||!_clip.valid()||_weaponBoneIndex<0)return true;
+ _holdingError.clear();
+ try{
+  // The native source is immutable. Always derive both sides from Ready, never
+  // from the previously rendered hand or a mirrored authoring preview.
+  std::array<HandPose,2> source;
+  const auto& locals=_readyLocalPose;const auto& globals=_readyGlobalPose;
+  if(locals.size()!=_skeleton.bones.size()||globals.size()!=locals.size())throw std::runtime_error("Ready pose unavailable");
+  for(auto hand:{PoseHand::Left,PoseHand::Right}){auto& p=source[int(hand)];p.hand=hand;p.name="Firing grip";p.placement.anchorKind="weapon";p.placement.anchorName="Weapon";QString error;if(!captureHandPose(_skeleton,locals,globals,globals[_weaponBoneIndex],p,error))throw std::runtime_error(error.toStdString());}
+  const bool matchingCapture=currentWeapon()&&_holdingCapture.value("weapon").toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)==0&&(_holdingCapture.value("gripNode").toString().isEmpty()||_holdingCapture.value("gripNode").toString()==holdingGripVariant());
+  if(matchingCapture&&_holdingCapture.contains("nativeRight")){
+   source[1].placement.handInWeapon=source[1].placement.handInAnchor=readPose(_holdingCapture.value("nativeRight"));const auto f=_holdingCapture.value("nativeFingers").toArray();if(f.size()==15)for(int i=0;i<15;++i)source[1].fingers[i]=readPose(f[i]);
+   if(_holdingCapture.contains("nativeSupport")){source[0].placement.handInWeapon=source[0].placement.handInAnchor=readPose(_holdingCapture.value("nativeSupport"));const auto sf=_holdingCapture.value("supportFingers").toArray();if(sf.size()==15)for(int i=0;i<15;++i)source[0].fingers[i]=readPose(sf[i]);}
+  }
+  const float planeX=matchingCapture&&_holdingCapture.value("leftGripMirror")=="geometry-plane-hand-z"?float(_holdingCapture.value("mirrorPlaneX").toDouble()):holdingMirrorPlaneX();
+  _holdingSolved=source;
+  if(_holdingHand==PoseHand::Left){
+   HandPose firing,support;QString error;
+   if(!mirrorHandPose(_skeleton,source[1],{},firing,error)||!mirrorHandPose(_skeleton,source[0],{},support,error))throw std::runtime_error(error.toStdString());
+   // The wrist and fingers share one geometric reflection. The controller
+   // basis affects weapon aiming, never the authored hand-to-mesh contact.
+   auto left = hm::mirroredHandSeat(mathPose(source[1].placement.handInWeapon),hm::MirrorPlane{0,planeX});
+   const auto array=[](QJsonValue value,hm::V fallback){const auto a=value.toArray();if(a.size()==3)for(int i=0;i<3;++i)fallback[i]=float(a[i].toDouble());return fallback;};
+   if(matchingCapture){
+    const auto offsets=array(_holdingCapture.value("leftGripOffset"),{});
+    left.t=hm::point(left,{offsets[0],offsets[1],-offsets[2]});
+   }
+   firing.placement.handInWeapon=firing.placement.handInAnchor=previewPose(left);
+   auto rightSupport = hm::mirroredHandSeat(mathPose(source[0].placement.handInWeapon),hm::MirrorPlane{0,planeX});
+   if(matchingCapture){
+    const auto offsets=array(_holdingCapture.value("rightSupportOffset"),{});
+    rightSupport.t=hm::point(rightSupport,{offsets[0],offsets[1],-offsets[2]});
+   }
+   support.placement.handInWeapon=support.placement.handInAnchor=previewPose(rightSupport);
+   for(int i=0;i<15;++i){firing.fingers[i]=previewPose(hm::finger(mathPose(source[1].fingers[i])));support.fingers[i]=previewPose(hm::finger(mathPose(source[0].fingers[i])));}
+   _holdingSolved[0]=firing;_holdingSolved[1]=support;
+  }
+  const int firing=int(_holdingHand),other=1-firing;
+  const auto key=_holdingGrips.contains(holdingGripKey(_holdingHand))?holdingGripKey(_holdingHand):holdingGripKey(_holdingHand,false);
+  if(_holdingGrips.contains(key))readRecord(_holdingGrips[key].toObject(),_holdingSolved[firing]);
+  const auto workingKey=holdingGripKey(_holdingHand,_holdingSpecific);if(_holdingWorking.contains(workingKey))readRecord(_holdingWorking.value(workingKey).toObject(),_holdingSolved[firing]);
+  if(_holdingEditing&&_partGripDraft&&_partGripDraft->pose.hand==_holdingHand){_holdingSolved[firing]=_partGripDraft->pose;_holdingSolved[firing].placement.handInWeapon=_partGripDraft->pose.placement.handInAnchor;}
+  if(_holdingEditing&&_fingerDrafts[firing])_holdingSolved[firing].fingers=_fingerDrafts[firing]->fingers;
+  if(!_holdingSupport){auto& t=_holdingSolved[other].placement.handInWeapon.translation;t.x+=(other==0?-18:18);t.z-=18;}
+  if(_holdingReplay){
+   if(!currentWeapon()||_holdingCapture.value("weapon").toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)!=0)throw std::runtime_error("This capture belongs to another weapon; turn off captured-pose display to preview this weapon");
+   for(int h=0;h<2;++h){const auto j=_holdingCapture.value(h==0?"renderedLeft":"renderedRight").toObject();if(!j.isEmpty()){_holdingSolved[h].placement.handInWeapon=readPose(j["wrist"]);if(j["fingers"].toArray().size()==15)for(int i=0;i<15;++i)_holdingSolved[h].fingers[i]=readPose(j["fingers"].toArray()[i]);}}
+  }
+  const auto weapon=_globalPose[_weaponBoneIndex];
+  for(int h=0;h<2;++h){if(_simulationActive&&_simulation.action==SimulationAction::Held&&h==int(_interactionHand))continue;const auto& p=_holdingSolved[h];const auto target=composed(weapon,p.placement.handInWeapon);if(!solvePartGrip(_skeleton,_localPose,_globalPose,p,target,_localPose,_globalPose,_holdingError,GripReach::FollowTarget,true))return true;}
+  return evaluateSceneBindings(_skeleton,_nodeBindings,_sourceLocalPose,_stateBaselineLocalPose,_globalPose,_boundLocalPose,_boundGlobalPose,_poseError)&&applySimulationPose();
+ }catch(const std::exception& e){_holdingError=QString::fromUtf8(e.what());return true;}
+}
+QJsonObject ReloadMakerController::holdingGripsCommand(const QJsonObject& p){
+ const auto op=p["operation"].toString("preview");
+ const auto stash=[this]{if(_holdingEditing&&_partGripDraft){auto pose=_partGripDraft->pose;pose.placement.handInWeapon=pose.placement.handInAnchor;if(_fingerDrafts[int(pose.hand)])pose.fingers=_fingerDrafts[int(pose.hand)]->fingers;_holdingWorking[holdingGripKey(pose.hand,_holdingSpecific)]=poseRecord(pose);_partGripDraft.reset();_fingerDrafts[int(pose.hand)].reset();}_holdingEditing=false;};
+ if(op=="geometry"){
+  auto* view=_window->getGLView();auto* model=activeModel();
+  if(!model||!view->getScene()||_weaponBoneIndex<0)throw std::runtime_error("Load a weapon before capturing contact geometry");
+  (void)view->studioCaptureFrame();
+  const auto inverse=hm::inverse(mathPose(_globalPose[_weaponBoneIndex]));
+  QJsonArray meshes;
+  for(auto* shape:view->getScene()->shapes){
+   if(!shape||shape->isHidden())continue;
+   QJsonArray vertices,triangles,bones;
+   for(const int bone:shape->reloadMakerSkinBones())bones.append(model->get<QString>(model->getBlockIndex(bone),"Name"));
+   for(const auto& vertex:shape->reloadMakerCollisionVertices()){
+    const auto world=shape->worldTrans()*vertex;
+    const auto local=hm::point(inverse,{world[0],world[1],world[2]});
+    vertices.append(QJsonArray{local[0],local[1],local[2]});
+   }
+   const auto count=shape->reloadMakerCollisionTriangleCount();
+   for(qsizetype i=0;i<count;++i){const auto t=shape->triangles[i];triangles.append(QJsonArray{int(t[0]),int(t[1]),int(t[2])});}
+   meshes.append(QJsonObject{{"block",shape->id()},{"name",model->get<QString>(model->getBlockIndex(shape->id()),"Name")},{"skinBones",bones},{"vertices",vertices},{"triangles",triangles}});
+  }
+  QJsonArray anchors;
+  for(const auto name:{"C-Barrel","C-Muzzle","C-Grip","C-Receiver","C-Scope"}){
+   const auto target=findConnectTarget(name,nullptr,0,false);Transformf parent;QString error;
+   if(target.valid()&&sceneNodeWorld(target.parent,parent,error)){
+    Transformf local{target.translation,target.rotation,{target.scale,target.scale,target.scale}};
+    anchors.append(QJsonObject{{"name",name},{"pose",jsonPose(previewPose(hm::compose(inverse,mathPose(composed(parent,local)))))}});
+   }
+  }
+  QJsonArray nodes;
+  for(const auto& node:_sceneNodes){Transformf world;QString error;if(sceneNodeWorld(node,world,error))nodes.append(QJsonObject{{"name",model->get<QString>(node,"Name")},{"pose",jsonPose(previewPose(hm::compose(inverse,mathPose(world))))}});}
+  return {{"space","weapon-local"},{"meshes",meshes},{"anchors",anchors},{"nodes",nodes}};
+ }
+ if(op=="open"){showHoldingGrips();return holdingGripsState();}
+ if(_loadThread||_reloadCapturing||espBusy())throw std::runtime_error("Wait for the current source or capture operation before editing holding grips");
+ if(op=="preview"){
+  if(!p["enabled"].toBool(true)||(p.contains("hand")&&(p["hand"]=="left")!=(_holdingHand==PoseHand::Left))||(p.contains("specific")&&p["specific"].toBool()!=_holdingSpecific))stash();
+  _holdingPreview=p["enabled"].toBool(true);if(p.contains("hand")){if(p["hand"]!="left"&&p["hand"]!="right")throw std::runtime_error("Choose left or right");_holdingHand=p["hand"]=="left"?PoseHand::Left:PoseHand::Right;}
+  if(p.contains("support"))_holdingSupport=p["support"].toBool();if(p.contains("replay"))_holdingReplay=p["replay"].toBool();if(p.contains("specific"))_holdingSpecific=p["specific"].toBool();
+  if(_holdingReplay&&(_holdingCapture.value("holdingHand")=="left"||_holdingCapture.value("holdingHand")=="right"))_holdingHand=_holdingCapture.value("holdingHand")=="left"?PoseHand::Left:PoseHand::Right;
+ }else if(op=="clear-capture"){_holdingCapture={};_holdingReplay=false;
+ }else if(op=="import-capture"){
+  QFile f(p["path"].toString());if(!f.open(QIODevice::ReadOnly))throw std::runtime_error("Cannot open runtime capture");const auto j=QJsonDocument::fromJson(f.readAll()).object();if(j["format"]!="rock-holding-grip-capture"||j["version"]!=1)throw std::runtime_error("Unknown holding capture");(void)readPose(j["rightBoneInWand"]);(void)readPose(j["leftBoneInWand"]);_holdingCapture=j;
+ }else if(op=="edit"){
+  if(!_holdingPreview||!currentWeapon()||!_clip.valid())throw std::runtime_error("Load a native pose and enable the holding preview first");(void)applyPose(_playbackTime);if(!_holdingError.isEmpty())throw std::runtime_error(_holdingError.toStdString());
+  auto pose=_holdingSolved[int(_holdingHand)];pose.id=QUuid::createUuid().toString(QUuid::WithoutBraces);pose.createdUtc=QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);pose.placement.handInAnchor=pose.placement.handInWeapon;pose.source=currentPoseSource();
+  setWorkspace(2);setHandEditorPage(HandEditorPage::PartGrip);int anchor=-1;for(int i=0;i<_handPoseAnchors.size();++i)if(_handPoseAnchors[i].description.anchorKind=="weapon"){anchor=i;break;}if(anchor<0)throw std::runtime_error("Weapon reference is unavailable");
+  QString error;if(!preparePartGripFrame(anchor,error))throw std::runtime_error(error.toStdString());setGripAnchor(anchor);_editingMagazine=false;_partGripDraft=PartGrip{pose,poseRecordKey(currentWeapon()->formId),pose.id};setGripDraftName(_holdingHand==PoseHand::Left?"Left firing grip":"Right firing grip");setEditedHand(_holdingHand);_fingerDrafts[int(_holdingHand)].reset();_holdingEditing=true;showPartGripValues();
+ }else if(op=="fingers"){
+  if(!_holdingEditing||!_partGripDraft)holdingGripsCommand({{"operation","edit"}});setEditedHand(_holdingHand);setWorkspace(2);setHandEditorPage(HandEditorPage::FingerPoses);
+ }else if(op=="save"){
+  if(!_holdingEditing||!_partGripDraft||_partGripDraft->pose.hand!=_holdingHand||!currentWeapon()||_partGripDraft->weaponRecord.compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)!=0)throw std::runtime_error("Use Edit placement before saving a firing grip");auto pose=_partGripDraft->pose;pose.placement.handInWeapon=pose.placement.handInAnchor;if(_fingerDrafts[int(pose.hand)])pose.fingers=_fingerDrafts[int(pose.hand)]->fingers;auto j=poseRecord(pose);j["weapon"]=poseRecordKey(currentWeapon()->formId);j["gripNode"]=_holdingSpecific?holdingGripVariant():QString();j["powerArmor"]=_holdingCapture.value("weapon").toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)==0&&_holdingCapture.value("powerArmor").toBool();_holdingGrips[holdingGripKey(pose.hand,_holdingSpecific)]=j;_holdingWorking.remove(holdingGripKey(pose.hand,_holdingSpecific));_partGripDraft->pose.fingers=pose.fingers;_fingerDrafts[int(pose.hand)].reset();
+ }else if(op=="reset"){
+  _holdingGrips.remove(holdingGripKey(_holdingHand,_holdingSpecific));_holdingWorking.remove(holdingGripKey(_holdingHand,_holdingSpecific));_holdingEditing=false;_partGripDraft.reset();_fingerDrafts[int(_holdingHand)].reset();
+ }else if(op=="export"){
+  QJsonArray grips;for(const auto& v:_holdingGrips)if(currentWeapon()&&v.toObject()["weapon"].toString().compare(poseRecordKey(currentWeapon()->formId),Qt::CaseInsensitive)==0)grips.append(v);if(!currentWeapon())throw std::runtime_error("Load a weapon before exporting firing grips");QFileInfo info(p["path"].toString());QDir().mkpath(info.absolutePath());QSaveFile f(info.absoluteFilePath());if(!f.open(QIODevice::WriteOnly)||f.write(QJsonDocument(QJsonObject{{"format","rock-holding-grips"},{"version",1},{"space","weapon-local"},{"fingerSpace","parent-local"},{"matrixConvention","active-row-major"},{"units","game"},{"grips",grips}}).toJson())<0||!f.commit())throw std::runtime_error("Cannot save holding grips");
+ }else throw std::runtime_error("Unknown holding-grip operation");
+ if(_clip.valid())(void)applyPose(_playbackTime);if(auto* b=_window->findChild<QPushButton*>("HoldingGripButton"))b->setText(_holdingPreview?(_holdingHand==PoseHand::Left?"Holding: Left":"Holding: Right"):"Holding grip");noteDocumentChange("holding grip");return holdingGripsState();
+}
+void ReloadMakerController::showHoldingGrips(){
+ auto* d=new QDialog(_window);d->setAttribute(Qt::WA_DeleteOnClose);d->setWindowTitle("Holding hand and firing grips");auto* layout=new QVBoxLayout(d);auto* side=new QComboBox(d);side->addItem("Right firing hand","right");side->addItem("Left firing hand","left");side->setCurrentIndex(_holdingHand==PoseHand::Left?1:0);layout->addWidget(side);auto* enabled=new QCheckBox("Preview holding grip",d);enabled->setChecked(_holdingPreview);layout->addWidget(enabled);auto* support=new QCheckBox("Place the other hand on its support grip",d);support->setChecked(_holdingSupport);layout->addWidget(support);auto* specific=new QCheckBox("Use captured grip variant when available (off: weapon default)",d);specific->setChecked(_holdingSpecific);layout->addWidget(specific);auto* replay=new QCheckBox("Show captured runtime hands",d);replay->setToolTip("Uses the capture's holding hand. Turn this off to switch prediction sides.");replay->setChecked(_holdingReplay);layout->addWidget(replay);auto* status=new QLabel(d);status->setWordWrap(true);layout->addWidget(status);
+ const auto refresh=[=,this]{side->setCurrentIndex(_holdingHand==PoseHand::Left?1:0);status->setText(!_holdingError.isEmpty()?_holdingError:!_holdingCapture.contains("rightBoneInWand")?"Source holding preview. Import a ROCK capture to compare its actual rendered hands. Reload-hand selection remains independent.":"ROCK capture loaded. Toggle captured runtime hands to compare the recorded pose with the current mirrored contact calculation.");const auto state=holdingGripsState();if(state.contains("wristDifferenceGameUnits"))status->setText(status->text()+QString("\nWrist difference: %1 game units, %2 degrees.").arg(state["wristDifferenceGameUnits"].toDouble(),0,'f',3).arg(state["wristAngleDegrees"].toDouble(),0,'f',2));};
+ const auto invoke=[=,this](QJsonObject p){try{holdingGripsCommand(p);}catch(const std::exception& e){status->setText(e.what());return;}refresh();};
+ const auto preview=[=,this]{invoke({{"operation","preview"},{"enabled",enabled->isChecked()},{"hand",side->currentData().toString()},{"support",support->isChecked()},{"replay",replay->isChecked()},{"specific",specific->isChecked()}});};
+ connect(side,qOverload<int>(&QComboBox::activated),d,[=,this](int){preview();});connect(enabled,&QCheckBox::toggled,d,[=,this](bool){preview();});connect(support,&QCheckBox::toggled,d,[=,this](bool){preview();});connect(replay,&QCheckBox::toggled,d,[=,this](bool){preview();});connect(specific,&QCheckBox::toggled,d,[=,this](bool){preview();});
+ for(const auto& pair:std::initializer_list<std::pair<QString,QString>>{{"Use source-only preview","clear-capture"},{"Edit wrist placement","edit"},{"Edit finger joints","fingers"},{"Save this hand's firing grip","save"},{"Reset this hand in selected scope","reset"}}){auto* b=new QPushButton(pair.first,d);layout->addWidget(b);connect(b,&QPushButton::clicked,d,[=,this]{invoke({{"operation",pair.second}});});}
+ auto* capture=new QPushButton("Import ROCK capture…",d);layout->addWidget(capture);connect(capture,&QPushButton::clicked,d,[=,this]{const auto path=QFileDialog::getOpenFileName(d,"ROCK holding capture",QString(),"JSON (*.json)");if(!path.isEmpty())invoke({{"operation","import-capture"},{"path",path}});});
+ auto* exportButton=new QPushButton("Export firing grips for ROCK…",d);layout->addWidget(exportButton);connect(exportButton,&QPushButton::clicked,d,[=,this]{const auto instance=reloadmaker::loadInstallationSetup().mo2Instance;const auto folder=instance.isEmpty()?QString():QDir(instance).filePath("mods/ROCK/F4SE/Plugins/ROCK/HoldingGrips")+"/";const auto path=QFileDialog::getSaveFileName(d,"Save under your ROCK mod's F4SE/Plugins/ROCK/HoldingGrips folder",folder+(currentWeapon()?poseRecordKey(currentWeapon()->formId).replace(':','_'):QString("holding-grips"))+".json","JSON (*.json)");if(!path.isEmpty())invoke({{"operation","export"},{"path",path}});});refresh();d->resize(450,360);d->show();
+}
+}

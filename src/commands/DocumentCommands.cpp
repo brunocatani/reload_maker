@@ -1,0 +1,394 @@
+#include "ReloadMakerController.h"
+#include "StudioWindow.h"
+#include "StudioPaths.h"
+#include "ReloadBundle.h"
+#include "commands/CommandSupport.h"
+#include "areas/loadout/LoadoutNames.h"
+#include "glview.h"
+#include "model/nifmodel.h"
+
+#include <QCoreApplication>
+#include <QFile>
+#include <QJsonDocument>
+#include <QPlainTextEdit>
+#include <QThread>
+#include <QTimer>
+
+#include <algorithm>
+
+namespace reloadmaker
+{
+    using commands::require;
+
+    void ReloadMakerController::registerDocumentCommands()
+    {
+        _commands.add({"inspect_reload",CommandAccess::Read,CommandGate::WhenIdle,
+            [this](const QJsonObject&)->std::optional<QJsonObject> {return reloadInspection();}});
+        _commands.add({"model_override",CommandAccess::Edit,CommandGate::WhenIdle,
+            [this](const QJsonObject& params)->std::optional<QJsonObject>{return assignModelOverride(params);}});
+        _commands.add({ "state", CommandAccess::Read, CommandGate::Always,
+                        [this](const QJsonObject& p) -> std::optional<QJsonObject> {
+                            QStringList fields;
+                            for (const auto& field : p["fields"].toArray()) fields.append(field.toString());
+                            return studioState(fields);
+                        } });
+
+        _commands.add({ "focus", CommandAccess::Edit, CommandGate::Always,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> {
+                            _window->showOnPreferredScreen();
+                            _window->raise();
+                            _window->activateWindow();
+                            return studioState();
+                        } });
+
+        // A second editor launched through MO2 hands its verified source over to
+        // this one; this editor saves and closes so the new one owns the workspace.
+        _commands.add({ "accept_source_session", CommandAccess::Edit, CommandGate::Always,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            require(!_profileHandoff.isEmpty() && params["token"].toString() == _profileHandoff,
+                                    "No matching MO2 handoff is pending");
+                            require(!_loadThread && !_reloadCapturing && !_packProcess && !espBusy() && !espDirty(),
+                                    "The open editor has unsaved changes; save or discard them first. Source handoff cancelled");
+                            _profileHandoff.clear();
+                            QTimer::singleShot(0, _window, [this] { _window->close(); });
+                            return QJsonObject{ { "accepted", true } };
+                        } });
+
+        _commands.add({ "diagnostics", CommandAccess::Read, CommandGate::Always,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> { return diagnosticsState(); } });
+
+        _commands.add({ "pose", CommandAccess::Read, CommandGate::Always,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> { return poseState(); } });
+
+        _commands.add({ "cancel", CommandAccess::Edit, CommandGate::Always,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> {
+                            if (_loadThread) {
+                                _loadThread->requestInterruption();
+                            }
+                            if (_reloadCapturing) {
+                                invalidateReloadCapture();
+                            }
+                            return studioState();
+                        } });
+
+        _commands.add({ "home", CommandAccess::Edit, CommandGate::Always,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            return params.contains("role") ? chooseHomeRole(params["role"].toString()) : homeState();
+                        } });
+
+        _commands.add({ "workspace", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            const int index = params["index"].toInt(-1);
+                            require(validWorkspace(index), "Unknown workspace");
+                            // handsPage picks the hand editor page, as the rail does:
+                            // 0 Poses library, 1 Part grips, 2 Mechanisms, 3 Grab points.
+                            const int page = params["handsPage"].toInt(-1);
+                            require(!params.contains("handsPage") || (index == GripsWorkspace && page >= 0 && page <= 3),
+                                    "handsPage needs workspace 2 and a page from 0 to 3");
+                            // magazineStep picks the Magazines sub-step on workspace 10:
+                            // 0 Pieces, 1 Insertion guide (2 Hand fit, 3 World models are
+                            // workspaces 2 and 7).
+                            const int step = params["magazineStep"].toInt(-1);
+                            require(!params.contains("magazineStep") || (index == MagazinesWorkspace && (step == 0 || step == 1)),
+                                    "magazineStep needs workspace 10 and step 0 or 1");
+                            if (params.contains("magazineStep")) {
+                                _magazineStep = MagazineStep(step);
+                            }
+                            setWorkspace(index);
+                            if (params.contains("handsPage") && _workspace == GripsWorkspace) {
+                                setHandEditorPage(HandEditorPage(page));
+                            }
+                            if (params.contains("magazineStep")) {
+                                showMagazineStep(MagazineStep(step));
+                            }
+                            return std::nullopt;
+                        } });
+
+        // The deliberate save of the whole ESP project: captures the edited
+        // weapons' configurations, then commits one new dated version. The
+        // job reports through pack_job(state); state.busy stays true until done.
+        _commands.add({ "save_project", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            require(!params.contains("path") || params["path"].toString().isEmpty(),
+                                    "Projects are saved per source ESP; there is no path to choose");
+                            return startEspSave(params);
+                        } });
+
+        _commands.add({ "esp_project", CommandAccess::Read, CommandGate::Always,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> { return espState(); } });
+        _commands.add({ "save_plan", CommandAccess::Read, CommandGate::WhenIdle,
+                        [this](const QJsonObject&) -> std::optional<QJsonObject> { return capturePlanState(); } });
+
+        // Loads or deletes exactly one saved version of the open ESP project.
+        _commands.add({ "esp_version", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            const auto operation = params["operation"].toString();
+                            const auto save = params["save"].toString();
+                            require(!save.isEmpty(), "Choose a saved version");
+                            if (operation == "load") {
+                                return loadEspVersion(save);
+                            }
+                            require(operation == "delete", "Choose load or delete");
+                            return deleteEspVersion(save);
+                        } });
+
+        // An earlier per-weapon project, imported as unsaved edits of its
+        // weapon in that weapon's ESP project.
+        _commands.add({ "import_project", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            return importLegacyProject(params["path"].toString());
+                        } });
+
+        _commands.add({ "import_records", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            return importAuthoredRecords(params["paths"].toArray());
+                        } });
+
+        _commands.add({ "export", CommandAccess::Edit, CommandGate::WhenIdle,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> {
+                            if (params["kind"].toString() == "project") {
+                                return exportWeaponProject(params["path"].toString());
+                            }
+                            return exportRecord(params["kind"].toString());
+                        } });
+    }
+
+    QJsonObject ReloadMakerController::reloadInspection()
+    {
+        require(currentWeapon()&&_simulationRig&&_reloadRecipe,"Prepare the selected reload in Operate first");
+        auto result=commandStatus();
+        result["operating"]=operatingSetupState();result["guide"]=magazineGuideState();
+        result["reference"]=magazineReferenceState();result["inheritance"]=authoringPlanSources();
+        result["simulation"]=simulationState();result["animationSource"]=animationSourceIdentity();
+        QJsonArray sources,requests,parts;
+        if(auto* model=activeModel())for(int i=0;i<_sceneNodes.size()&&i<_assemblyNodes.size();++i) {
+            const auto name=model->get<QString>(_sceneNodes[i],"Name");
+            // The preview skeleton spells its canonical mount WEAPON. Export
+            // uses the HKX Weapon frame; preserve every model/helper node below
+            // it and disclose this frame-name translation in static evidence.
+            const bool mount=_sceneNodes[i]==_canonicalNodes.value(normalizedKey(QStringLiteral("Weapon")));
+            const bool instance=_sceneNodes[i]==_weaponRoot;
+            const auto runtimeName=mount?_skeleton.bones[_weaponBoneIndex].name:instance?
+                QStringLiteral("Weapon  (%1)").arg(QString::number(currentWeapon()->formId,16).rightJustified(8,'0').toUpper()):name;
+            sources.append(QJsonObject{{"key",i+1},{"parent",_assemblyNodes[i].parent+1},
+                {"name",runtimeName},{"editorName",name}});
+        }
+        requests.append(QJsonObject{{"role","frame"},{"path","Weapon"}});
+        for(int track:runtimeOperatingTracks())if(track>=0)requests.append(QJsonObject{{"role","operating"},{"track",track},{"path",runtimeTrackPath(track)}});
+        for(int i=0;i<_reloadRecipe->tracks.size();++i) {
+            const auto& track=_reloadRecipe->tracks[i];
+            parts.append(QJsonObject{{"track",i},{"name",track.anchor.anchorName},{"path",runtimeTrackPath(i)},
+                {"model",track.anchor.ownerModel},{"record",track.anchor.ownerRecord},
+                {"writer",_simulationPoseOwners.value(_reloadTrackNodes.value(i,-1),QStringLiteral("Native animation"))},
+                {"input",i==_simulationRig->slide},{"bolt",i==_simulationRig->bolt},
+                {"magazine",_simulationRig->magazineTracks.contains(i)}});
+        }
+        result["parts"]=parts;
+        result["bindingScene"]=QJsonObject{{"weaponForm",double(currentWeapon()->formId)},{"sources",sources},{"requests",requests},
+            {"frameConvention","editor-hierarchy-with-runtime-mount-and-base-instance-names"}};
+        return result;
+    }
+
+    QJsonObject ReloadMakerController::diagnosticsState() const
+    {
+        QJsonArray remaps;
+        for (const auto& remap : _remappedAttachments) {
+            Transformf world;
+            Transformf parent;
+            Transformf root;
+            QString error;
+            if (!sceneNodeWorld(remap.node, world, error) || !sceneNodeWorld(remap.parent, parent, error) ||
+                !sceneNodeWorld(_partRoots.value(remap.slot), root, error)) {
+                continue;
+            }
+            remaps.append(QJsonObject{ { "keyword", remap.keyword }, { "point", remap.point },
+                                       { "slot", QString::number(remap.slot) },
+                                       { "world", commands::transformJson(world) },
+                                       { "parentWorld", commands::transformJson(parent) },
+                                       { "attachmentWorld", commands::transformJson(root) } });
+        }
+        return { { "text", _diagnosticLines.join(QLatin1Char('\n')) }, { "viewport", _window->getGLView()->studioDiagnostics() },
+                 { "attachmentRemaps", remaps }, { "weaponLibrary", _weaponLibraryReport } };
+    }
+
+    QJsonObject ReloadMakerController::poseState() const
+    {
+        QJsonArray bones;
+        for (int i = 0; i < _localPose.size(); ++i) {
+            bones.append(QJsonObject{ { "index", i }, { "name", _skeleton.bones[i].name },
+                                      { "local", commands::transformJson(_localPose[i]) },
+                                      { "world", commands::transformJson(_globalPose[i]) } });
+        }
+        QJsonArray parts;
+        // Anchor 0 is the weapon itself; parts start at 1.
+        for (int i = 1; i < _handPoseAnchors.size(); ++i) {
+            const auto& anchor = _handPoseAnchors[i];
+            Transformf world;
+            QString error;
+            if (!sceneNodeWorld(anchor.node, world, error)) {
+                continue;
+            }
+            parts.append(QJsonObject{ { "index", i }, { "name", anchor.description.anchorName },
+                                      { "kind", anchor.description.anchorKind },
+                                      { "ownerRecord", anchor.description.ownerRecord },
+                                      { "ownerModel", anchor.description.ownerModel },
+                                      { "world", commands::transformJson(world) } });
+        }
+        return { { "source", currentPoseSource() }, { "bones", bones }, { "parts", parts } };
+    }
+
+    // Imports validate each record against its domain contract but store the
+    // original bytes: re-normalizing float matrices would turn an identical
+    // re-import into a false ID conflict. Nothing is written unless every record
+    // in the batch is valid and conflict-free.
+    QJsonObject ReloadMakerController::importAuthoredRecords(const QJsonArray& paths)
+    {
+        require(!paths.isEmpty() && paths.size() <= 1000, "Choose 1–1000 authored JSON records");
+        struct Pending
+        {
+            QString path;
+            QByteArray bytes;
+        };
+        QVector<Pending> pending;
+        QJsonArray destinations;
+        for (const auto& entry : paths) {
+            QFile input(entry.toString());
+            require(input.open(QIODevice::ReadOnly) && input.size() <= 64 * 1024 * 1024,
+                    "Cannot read authored record: " + entry.toString());
+            const auto bytes = input.readAll();
+            QString error;
+            QString id;
+            QString directory;
+            QByteArray validated;
+            const auto kind = QJsonDocument::fromJson(bytes).object()["format"].toString();
+            if (kind == "reload-maker-hand-pose") {
+                HandPose value;
+                require(decodeHandPose(bytes, value, error), error);
+                id = value.id;
+                directory = HandPoseLibrary::defaultDirectory();
+                validated = encodeHandPose(value, error);
+            } else if (kind == "reload-maker-part-mechanism") {
+                PartMechanism value;
+                require(decodeMechanism(bytes, value, error), error);
+                id = value.id;
+                directory = MechanismLibrary::defaultDirectory();
+                validated = encodeMechanism(value, error);
+            } else {
+                PartGrip value;
+                require(decodePartGrip(bytes, value, error), error);
+                id = value.pose.id;
+                directory = PartGripLibrary::defaultDirectory();
+                validated = encodePartGrip(value, error);
+            }
+            require(error.isEmpty() && !validated.isEmpty(), error);
+            validated = bytes;
+            const QString destination = QDir(directory).filePath(id + ".json");
+            QFile existing(destination);
+            if (existing.exists()) {
+                const bool same = existing.open(QIODevice::ReadOnly) &&
+                                  QJsonDocument::fromJson(existing.readAll()) == QJsonDocument::fromJson(validated);
+                require(same, "A different record already owns this ID: " + destination);
+            } else {
+                const auto staged = std::find_if(pending.begin(), pending.end(),
+                                                 [&](const auto& value) { return value.path == destination; });
+                if (staged != pending.end()) {
+                    require(QJsonDocument::fromJson(staged->bytes) == QJsonDocument::fromJson(validated),
+                            "Conflicting IDs within the import batch: " + destination);
+                } else {
+                    pending.append({ destination, validated });
+                }
+            }
+            destinations.append(destination);
+        }
+        for (const auto& file : pending) {
+            commands::writeFileAtomically(file.path, file.bytes);
+        }
+        refreshHandPoseLibrary();
+        ++_revision;
+        return { { "files", destinations }, { "imported", pending.size() } };
+    }
+
+    // Exports stay in the workspace's exports folder; they never deploy.
+    QJsonObject ReloadMakerController::exportRecord(const QString& kind)
+    {
+        if (kind == "scope") {
+            return exportScopeProfile();
+        }
+        QString error;
+        QByteArray bytes;
+        QString id;
+        if (kind == "slide") {
+            const auto record = exportSlideProfile();
+            require(!record.isEmpty(), "Prepare a pistol simulation with native rig bindings before exporting");
+            bytes = QJsonDocument(record).toJson();
+            id = _reloadRecipe->id;
+        } else if (kind == "grab_locations") {
+            const auto record = exportGrabLocations();
+            require(!record.isEmpty(), "Configure grab locations first");
+            bytes = QJsonDocument(record).toJson();
+            id = _reloadRecipe->id;
+        } else if (kind == "sounds") {
+            const auto record = exportSounds();
+            require(!record.isEmpty(), "Prepare a weapon in Operate before exporting sounds");
+            bytes = QJsonDocument(record).toJson();
+            id = _reloadRecipe->id;
+        } else if (kind == "simulation") {
+            const auto record = exportSimulation();
+            require(!record.isEmpty(), "Prepare a simulation before exporting");
+            bytes = QJsonDocument(record).toJson();
+            id = _reloadRecipe->id;
+        } else if (kind == "runtime_configuration") {
+            const auto record = exportRuntimeConfiguration();
+            bytes = QJsonDocument(record).toJson();
+            id = _reloadRecipe->id;
+        } else if (kind == "reload_bundle") {
+            require(_reloadRecipe.has_value(), "Learn the configured reload first");
+            bytes = exportReloadBundle(error);
+            id = _reloadRecipe->id;
+        } else if (kind == "reload") {
+            require(_reloadRecipe.has_value(), "No reload recipe");
+            bytes = encodeReloadRecipe(*_reloadRecipe, error);
+            id = _reloadRecipe->id;
+        } else if (kind == "grip") {
+            require(_partGripDraft.has_value(), "No grip draft");
+            bytes = encodePartGrip(*_partGripDraft, error);
+            id = _partGripDraft->pose.id;
+        } else if (kind == "mechanism") {
+            require(_mechanismDraft.has_value(), "No mechanism draft");
+            bytes = encodeMechanism(*_mechanismDraft, error);
+            id = _mechanismDraft->id;
+        } else if (kind == "hand") {
+            const auto* pose = selectedHandPose();
+            require(pose, "Choose a saved hand pose");
+            bytes = encodeHandPose(*pose, error);
+            id = pose->id;
+        } else {
+            require(false, "Export kind must be project, hand, grip, mechanism, reload, reload_bundle, simulation, slide, "
+                           "sounds, grab_locations, scope or runtime_configuration");
+        }
+        require(error.isEmpty() && !bytes.isEmpty(), error);
+        const QString path = studioDataPath("exports/" + kind + "-" + id + ".json");
+        commands::writeFileAtomically(path, bytes);
+        return { { "path", path }, { "kind", kind }, { "deployed", false } };
+    }
+
+    // Version 2 bundles carry the authored operating grips and grab locations.
+    QByteArray ReloadMakerController::exportReloadBundle(QString& error)
+    {
+        const auto magazine = simulationMagazineAnchor();
+        QByteArray bytes = encodeReloadBundle(*_reloadRecipe, _partGrips, _mechanisms, _magazineGrabGrips, error,
+                                              _magazineGrabDefaults,
+                                              magazine.ownerRecord.isEmpty() ? nullptr : &magazine);
+        if (bytes.isEmpty()) {
+            return bytes;
+        }
+        auto bundle = QJsonDocument::fromJson(bytes).object();
+        const auto interactions = exportInteractionGrips();
+        require(!interactions.isEmpty(), "Operating grip assignments could not be resolved for export");
+        if (!interactions["operatingGroups"].toArray().isEmpty() || interactions.contains("grabLocations")) {
+            bundle["version"] = 2;
+            bundle["authoredInteractions"] = interactions;
+        }
+        return QJsonDocument(bundle).toJson();
+    }
+}

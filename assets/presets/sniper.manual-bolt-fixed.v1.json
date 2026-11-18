@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "id": "sniper.manual-bolt-fixed.v1",
+  "label": "Bolt action — individual rounds, fixed magazine",
+  "category": "Sniper",
+  "model": {
+    "feed": {
+      "container": "fixed", "magazineRelease": "none",
+      "loadingPoints": [{"id": "loading-port", "unit": "round", "destination": "container", "requiresOpen": "bolt"}]
+    },
+    "mechanisms": [{"id": "bolt", "kind": "turn-bolt", "roles": ["extract", "eject", "cock", "chamber"], "return": "stays"}],
+    "fire": {"motion": "nothing", "afterShot": "manual-cycle", "ejection": "on-manual-cycle", "manualCycle": "bolt"}
+  }
+}

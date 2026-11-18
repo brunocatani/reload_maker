@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "id": "rifle.lever-tube.v1",
+  "label": "Lever action — side-loaded tube",
+  "category": "Rifle",
+  "model": {
+    "feed": {
+      "container": "fixed", "magazineRelease": "none",
+      "loadingPoints": [{"id": "loading-gate", "unit": "round", "destination": "container"}]
+    },
+    "mechanisms": [{"id": "lever", "kind": "lever", "roles": ["extract", "eject", "cock", "chamber"], "return": "stays"}],
+    "fire": {"motion": "nothing", "afterShot": "manual-cycle", "ejection": "on-manual-cycle", "manualCycle": "lever"}
+  }
+}

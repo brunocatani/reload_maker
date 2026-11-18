@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "reload-maker": {
+      "command": "py",
+      "args": ["-3.14", "<Reload Maker folder>/mcp/server.py"],
+      "env": {
+        "TEMP": "<Reload Maker folder>/local/tmp",
+        "TMP": "<Reload Maker folder>/local/tmp",
+        "PYTHONPYCACHEPREFIX": "<Reload Maker folder>/local/pycache"
+      }
+    }
+  }
+}

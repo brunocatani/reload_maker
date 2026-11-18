@@ -1,0 +1,196 @@
+#include "WeaponConfiguration.h"
+
+#include <QRegularExpression>
+#include <algorithm>
+
+namespace reloadmaker
+{
+    namespace
+    {
+        std::uint32_t collectionMember(const PluginContent& plugin, std::uint32_t id)
+        {
+            QSet<std::uint32_t> visited;
+            while (!visited.contains(id)) {
+                visited.insert(id);
+                const auto* collection = plugin.findObjectMod(id);
+                if (!collection || (!collection->modCollection && collection->weaponModification) || collection->includes.isEmpty()) { break; }
+                const ObjectModInclude* chosen = &collection->includes.first();
+                for (const auto& include : collection->includes) {
+                    if (include.minLevel < chosen->minLevel) { chosen = &include; }
+                }
+                id = chosen->formId;
+            }
+            return id;
+        }
+
+        QString slotLabel(const ObjectModRecord& mod, const PluginContent& plugin)
+        {
+            // Labels are presentation only. Exclusivity/availability always use
+            // record identities, never these human-readable names.
+            static const QRegularExpression bracket(QStringLiteral("^\\[([^\\]]+)\\]"));
+            const auto match = bracket.match(mod.name.isEmpty() ? mod.editorId : mod.name);
+            QString label = match.hasMatch() ? match.captured(1) : plugin.keywordNames.value(mod.attachPoint);
+            if (label.startsWith(QStringLiteral("ap_"), Qt::CaseInsensitive)) { label = label.section('_', -1); }
+            const auto keywordBracket = bracket.match(label);
+            if (keywordBracket.hasMatch()) { label = keywordBracket.captured(1); }
+            if (label.compare(QStringLiteral("Mag"), Qt::CaseInsensitive) == 0) { label = QStringLiteral("Magazine"); }
+            if (label.isEmpty()) { label = QStringLiteral("Slot %1").arg(mod.attachPoint, 8, 16, QLatin1Char('0')); }
+            if (!mod.attachPoint) { label = QStringLiteral("Unclassified: %1").arg(mod.name.isEmpty() ? mod.editorId : mod.name); }
+            return label;
+        }
+    }
+
+    void WeaponConfiguration::initialize(const PluginContent& plugin, const WeaponRecord& weapon)
+    {
+        _weapon = weapon;
+        _mods.clear(); _slots.clear(); _selected.clear(); _warnings.clear();
+        // A template may include a mod collection (also with form type WEAP) whose
+        // levelled members the game picks from at spawn; the editor takes the
+        // lowest level, first declared. Nested collections resolve the same way.
+        QVector<std::uint32_t> defaults;
+        for (auto id : weapon.defaultObjectMods) {
+            id = collectionMember(plugin, id);
+            if (!defaults.contains(id)) { defaults.append(id); }
+        }
+        for (const auto& candidate : plugin.objectMods) {
+            if (candidate.modCollection) { continue; }
+            if (!candidate.targetType.isEmpty() && candidate.targetType != QStringLiteral("WEAP")) { continue; }
+            const bool isDefault = defaults.contains(candidate.formId);
+            if (!candidate.weaponModification && candidate.metadataWarning.isEmpty()) { continue; }
+            const bool targetMatches = std::any_of(candidate.targetKeywords.cbegin(), candidate.targetKeywords.cend(),
+                [&weapon](auto id) { return weapon.keywords.contains(id); });
+            if (!isDefault && !candidate.targetKeywords.isEmpty() && !targetMatches) { continue; }
+            _mods.append(candidate);
+            const SlotKey key = configurationSlotKey(candidate);
+            auto found = std::find_if(_slots.begin(), _slots.end(), [key](const auto& s) { return s.key == key; });
+            if (found == _slots.end()) {
+                _slots.append({key, candidate.attachPoint, slotLabel(candidate, plugin), {}, false, false});
+                found = _slots.end() - 1;
+            }
+            found->choices.append(candidate.formId);
+            found->hasModels |= !candidate.modelPath.isEmpty();
+            found->unverified |= weapon.attachParentSlots.isEmpty() || candidate.attachPoint == 0 || candidate.targetKeywords.isEmpty() ||
+                                 !candidate.metadataWarning.isEmpty();
+        }
+        for (auto id : defaults) {
+            const auto* candidate = mod(id);
+            if (!candidate) {
+                _warnings.append(QStringLiteral("Default modification %1 is not available in this plugin").arg(id, 8, 16, QLatin1Char('0')));
+                continue;
+            }
+            const SlotKey key = configurationSlotKey(*candidate);
+            if (_selected.contains(key) && _selected.value(key) != id) {
+                _warnings.append(QStringLiteral("Multiple default choices for slot %1; first declared default retained").arg(key, 0, 16));
+                continue;
+            }
+            _selected.insert(key, id);
+        }
+        std::stable_sort(_slots.begin(), _slots.end(), [](const auto& a, const auto& b) { return a.label.localeAwareCompare(b.label) < 0; });
+    }
+
+    const ConfigurationSlot* WeaponConfiguration::slot(SlotKey key) const
+    {
+        const auto it = std::find_if(_slots.cbegin(), _slots.cend(), [key](const auto& s) { return s.key == key; });
+        return it == _slots.cend() ? nullptr : &*it;
+    }
+
+    QString WeaponConfiguration::slotId(const PluginContent& plugin, const ConfigurationSlot& slot) const
+    {
+        return (slot.attachPoint ? "slot:" + recordIdentity(plugin, slot.attachPoint) : "mod:" + recordIdentity(plugin, std::uint32_t(slot.key))).toLower();
+    }
+
+    QJsonObject WeaponConfiguration::savedChoices(const PluginContent& plugin) const
+    {
+        QJsonObject result;
+        for (const auto& slot : _slots) {
+            result[slotId(plugin, slot)] = recordIdentity(plugin,selected(slot.key)).toLower();
+        }
+        return result;
+    }
+
+    QStringList WeaponConfiguration::restoreChoices(const PluginContent& plugin, const QJsonObject& choices)
+    {
+        QStringList missing;
+        for (auto it=choices.begin();it!=choices.end();++it) {
+            bool found=false;
+            for (const auto& slot : _slots) {
+                if(slotId(plugin,slot)!=it.key().toLower()||!it.value().isString())continue;
+                auto wanted=it.value().toString();
+                if(wanted.isEmpty()){(void)select(slot.key,0);found=true;break;}
+                for (const auto& candidate : plugin.objectMods) {
+                    if (candidate.modCollection && recordIdentity(plugin,candidate.formId).compare(wanted,Qt::CaseInsensitive)==0) {
+                        wanted=recordIdentity(plugin,collectionMember(plugin,candidate.formId));
+                        break;
+                    }
+                }
+                for(auto id:slot.choices)if(recordIdentity(plugin,id).compare(wanted,Qt::CaseInsensitive)==0){
+                    (void)select(slot.key,id);found=true;break;
+                }
+                break;
+            }
+            if(!found)missing.append(it.key()+" = "+it.value().toString());
+        }
+        return missing;
+    }
+
+    const ObjectModRecord* WeaponConfiguration::mod(std::uint32_t id) const
+    {
+        const auto it = std::find_if(_mods.cbegin(), _mods.cend(), [id](const auto& m) { return m.formId == id; });
+        return it == _mods.cend() ? nullptr : &*it;
+    }
+
+    bool WeaponConfiguration::select(SlotKey key, std::uint32_t id)
+    {
+        const auto* entry = slot(key);
+        if (!entry || (id && !entry->choices.contains(id))) { return false; }
+        if (_selected.value(key) == id) { return false; }
+        _selected.insert(key, id);
+        return true;
+    }
+
+    QHash<SlotKey, SlotKey> WeaponConfiguration::availableSlots() const
+    {
+        QHash<SlotKey, SlotKey> exposed;
+        for (auto id : _weapon.attachParentSlots) { if (slot(id)) { exposed.insert(id, 0); } }
+        for (const auto& entry : _slots) {
+            // A missing root-slot contract stays explicitly unverified in the UI.
+            if (!entry.attachPoint || _weapon.attachParentSlots.isEmpty()) { exposed.insert(entry.key, 0); }
+        }
+        for (int pass = 0; pass < _slots.size(); ++pass) {
+            bool changed = false;
+            for (const auto& entry : _slots) {
+                if (!exposed.contains(entry.key)) { continue; }
+                const auto* selection = mod(selected(entry.key));
+                if (!selection) { continue; }
+                for (auto child : selection->attachParentSlots) {
+                    if (slot(child) && !exposed.contains(child)) { exposed.insert(child, entry.key); changed = true; }
+                }
+                // Stat-only receiver variants sometimes retain vanilla slot
+                // keywords while their identical model uses the pack's slots.
+                // Keep selected attachments exposed by same-model siblings.
+                if (!selection->modelPath.isEmpty()) {
+                    for (auto candidateId : entry.choices) {
+                        const auto* candidate = mod(candidateId);
+                        if (!candidate || candidate->modelPath.compare(selection->modelPath, Qt::CaseInsensitive) != 0) { continue; }
+                        for (auto child : candidate->attachParentSlots) {
+                            if (slot(child) && !exposed.contains(child)) { exposed.insert(child, entry.key); changed = true; }
+                        }
+                    }
+                }
+            }
+            if (!changed) { break; }
+        }
+        return exposed;
+    }
+
+    QVector<std::uint32_t> WeaponConfiguration::activeMods() const
+    {
+        const auto exposed = availableSlots();
+        QVector<std::uint32_t> result;
+        for (const auto& entry : _slots) {
+            const auto id = selected(entry.key);
+            if (id && exposed.contains(entry.key)) { result.append(id); }
+        }
+        return result;
+    }
+}

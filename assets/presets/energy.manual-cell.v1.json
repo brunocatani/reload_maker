@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "id": "energy.manual-cell.v1",
+  "label": "Energy cell — manual removal",
+  "category": "Energy",
+  "model": {
+    "feed": {
+      "container": "detachable",
+      "magazineRelease": "manual",
+      "hands": ["left", "right"],
+      "loadingPoints": [{"id": "cell", "unit": "container", "destination": "container", "requiresOpen": ""}],
+      "insertion": "native-curve"
+    },
+    "mechanisms": [],
+    "fire": {"motion": "native-clip", "afterShot": "automatic-cycle", "ejection": "none", "lockOpen": ""}
+  }
+}

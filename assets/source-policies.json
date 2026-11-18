@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "auxiliaryReloadModes": ["1CAS_ServiceRifle.esp:00c7c0", "1CAS_ServiceRifle.esp:00d847"],
+  "policies": [
+    {
+      "id": "SA58 regular variants",
+      "weapon": "Wana_SA58.esp:000801",
+      "policy": {
+        "weaponAliases": ["Wana_SA58.esp:0059d2", "Wana_SA58.esp:0059d3", "Wana_SA58.esp:00624c"],
+        "magazineCollections": ["Wana_SA58.esp:00083c"]
+      }
+    },
+    {
+      "id": "MK18",
+      "weapon": "MK18.esp:000f9d",
+      "policy": {
+        "sourceOverride": {
+          "marker": "MK18AttachmentOverhaul.esp:00019e",
+          "present": false
+        }
+      }
+    },
+    {
+      "id": "MK18Empire",
+      "weapon": "MK18.esp:000f9d",
+      "policy": {
+        "sourceOverride": {
+          "marker": "MK18AttachmentOverhaul.esp:00019e",
+          "present": true
+        }
+      }
+    },
+    {
+      "id": "Thanatos",
+      "weapon": "DiaRifles.esp:00059e",
+      "policy": {
+        "magazineCollections": [
+          "DiaRifles.esp:00067b"
+        ]
+      }
+    }
+  ]
+}
