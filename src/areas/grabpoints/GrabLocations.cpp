@@ -347,6 +347,18 @@ namespace reloadmaker
             }
             g.points.append({ QUuid::createUuid().toString(QUuid::WithoutBraces), "Picked palm contact", _partGripDraft->surfaceContact->pointInAnchor, 3, 3 });
             i = g.points.size() - 1;
+        } else if (operation == "add") {
+            // A location given by its coordinates in the operating part's frame,
+            // for clients that measured the surface instead of clicking it.
+            if (!p.contains("pointInSource")) {
+                fail("Supply pointInSource: the location in the operating part's own frame.");
+            }
+            if (g.points.size() >= 32) {
+                fail("A group supports up to 32 locations.");
+            }
+            g.points.append({ QUuid::createUuid().toString(QUuid::WithoutBraces), QString("%1 point %2").arg(g.sourceName).arg(g.points.size() + 1), {}, 3, 3 });
+            i = g.points.size() - 1;
+            editGrabLocationFields(g, i, p);
         } else {
             if (i < 0 || i >= g.points.size()) {
                 fail("Select a grab location first.");

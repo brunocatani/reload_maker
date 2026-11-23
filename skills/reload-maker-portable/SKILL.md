@@ -21,6 +21,19 @@ The maintained developer contract is in the `build-diamond-reloads` skill's `ref
 
 All authored reloads use the [shared insertion-assist contract](build-diamond-reloads skill: references/insertion-assistance.md): wider finite-rail proximity plus loading-object contact, followed by a deliberate inward push. Maker previews surface proximity; DIAMOND queries the live weapon collision proxy using the solved held object. Existing packs receive the default without mass re-export.
 
+## Measure the weapon instead of looking at it
+
+A weapon is fully described by numbers the editor already holds, so author from measurements and keep renders for the cases the numbers flag.
+
+- `describe_weapon` is the first call on any weapon. Its one reply lists every part that moves in the reload (distance, weapon-local direction, turn, seconds), every drawn mesh with its size and the track it rides, the operating, bolt and magazine roles with suggested open and closed seconds, which physical hand carries the magazine and when its fingers are closed on it, exposed grab-point candidates on the operating part, the preset proposal, checklist gaps, clip events, the magazine rail and the slots. Read the motion table before choosing a preset: a handle that turns as it travels folds, a part that does not end at rest is left open or closed by the clip, a magazine that never leaves is a fixed feed.
+- `author_magazine_fit` gives the selected magazine its fit in one call: the carrying hand's exact native pose at the measured moment, mirrored to the other hand, with the contact of both measured. Repeat per magazine that has its own model; magazines sharing a model reuse the fit.
+- `measure_hand_contact` replaces a review render. It reports, per finger and palm, the gap between hand and magazine surface. A good fit reads every finger touching with at most about 0.5 units of sinking; fix a hand reported as buried or not gripping with `configure_magazine` and `set_part_grip`, then measure again.
+- `configure_grab_location(operation="add", values={"pointInSource": ...})` places an operating grab point from a measured candidate; no viewport pixel is needed. When `describe_weapon` reports that no drawn mesh rides the operating track, the handle is part of another mesh: that is the case for the charging-handle adaptation below, not for a guessed point.
+- `build_weapon_atlas` writes the same description for every weapon of a plugin, with an index. Weapons that share a reload clip share behavior, so read the index to see what one authoring pattern covers before starting a pack.
+- Render only when a measurement is contradictory or flags a problem you cannot explain from the numbers, and then render that one view.
+
+Without an MCP client, the same tools run from a shell: `python mcp/server.py --list` and `python mcp/server.py --call <tool> --arguments '<json>'` (the current revision is supplied for edits).
+
 ## Connect and establish authority
 
 Start the optional stdio adapter with `ReloadMakerMcp.cmd --workspace "<workspace>"`. The bundled runtime is sufficient. Native format adapters use the same launcher with `--adapter nif`, `--adapter archive` or `--adapter plugin` when that capability is required. Do not locate a developer's personal tools or install separate MCP servers.

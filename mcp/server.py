@@ -2,8 +2,12 @@
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP, Image
+
+# The bundled runtime starts isolated, so the adapter's own modules are named here.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 ROOT = Path(os.environ.get('RELOAD_MAKER_WORKSPACE', Path(__file__).resolve().parents[1])).resolve()
 os.environ['TEMP'] = os.environ['TMP'] = str(ROOT/'local/tmp')
@@ -115,6 +119,65 @@ def inspect_reload() -> dict:
     value['staticBinding']['nameTranslations']=[{k:row[k] for k in ('key','editorName','name')}
         for row in scene['sources'] if row['editorName']!=row['name']]
     return value
+
+@mcp.tool()
+def describe_weapon(hands: bool = True) -> dict:
+    """Measure the open weapon configuration instead of looking at it: start here.
+    One reply holds what an image would have to tell you. reload.movingTracks:
+    every part that moves in the reload, how far, along which weapon-local
+    direction, how much it turns and when. meshes: each drawn shape with its
+    size, centre and the tracks it rides (worked out from how its vertices
+    move), so you know which shape is the handle, the bolt or the magazine.
+    roles: the operating, bolt and magazine tracks with the suggested open and
+    closed seconds. hands: per physical hand, when its palm is at the magazine
+    or operating part in the native clip, and tightestWrap.seconds, the moment
+    to harvest a magazine hold with control_playback and save_hand_pose.
+    grabPoints.candidates: exposed surface points of the operating part, ready
+    for configure_grab_location(operation='add', values={'pointInSource': ...}).
+    Also the preset proposal, checklist gaps, clips with events, magazine rail
+    and slots. Scrubs the native clip and restores the view; leaves the editor
+    in Operate. hands=False skips the hand timeline."""
+    import perception
+    return perception.describe(command, hands)
+
+@mcp.tool()
+def measure_hand_contact(hand: str = '') -> dict:
+    """Numbers in place of a review render: how a physical hand sits on the
+    magazine it holds. hand='left' or 'right' takes the seated magazine with
+    that hand in Operate, pulls it clear, measures and lets go: use this to
+    check a saved fit. With no hand, the hand already shown holding the magazine,
+    or the fit being placed in configure_magazine, is measured; a hand holding
+    nothing is refused. Per finger and palm: the gap between hand surface and
+    magazine surface in game units (negative is inside), with touching, hovering
+    and buried lists and a verdict. An accepted hand-authored fit reads all five
+    fingers touching with at most about 0.5 units of sinking; a fit that sinks
+    0.7 or more needs its own correction."""
+    import perception
+    return perception.measure_contact(command, hand)
+
+@mcp.tool()
+def author_magazine_fit(hand: str = '', seconds: float | None = None) -> dict:
+    """Give the selected magazine its hand fit in one call, without a viewport.
+    Finds the physical hand that carries the magazine in the weapon's own reload
+    and the moment its fingers are closed on it (or uses the hand and seconds you
+    give), saves that exact native pose as this magazine's fit, mirrors it to the
+    other hand, then holds the magazine with each hand in Operate and returns the
+    measured contact of both. Select the magazine with configure_weapon first.
+    Nothing is written to the library until save_project."""
+    import perception
+    return perception.author_magazine_fit(command, hand, seconds)
+
+@mcp.tool()
+def build_weapon_atlas(output: str, plugin: str = '', limit: int = 10) -> dict:
+    """Describe every weapon of one plugin of the open source into a folder, a
+    few per call (each takes several seconds): <output>/<plugin>/<form id>.json
+    per weapon and index.json with one row each (preset, reload clip, operating
+    part travel, magazine timing). plugin defaults to the open weapon's. Call
+    again until remaining is empty. Weapons that share a reload clip share
+    behavior, so the index shows which ones one authoring pattern covers.
+    Changes the selected weapon; refuses while there are unsaved edits."""
+    import perception
+    return perception.atlas(command, output, plugin, limit)
 
 @mcp.tool()
 def assign_model_override(model: str, path: str, expected_revision: int, operation: str = 'set') -> dict:
@@ -376,7 +439,7 @@ def get_grab_locations() -> dict:
 
 @mcp.tool()
 def configure_grab_location(operation: str, expected_revision: int, values: dict | None = None) -> dict:
-    """open/pick/edit/remove/select/use_palm/save exact operating grab locations. pick takes viewport x/y and optional replace; edit takes id, name, pointInSource[3], radiusGame and handMask (left=1/right=2/both=3). Exports use kind=grab_locations. These are game acquisition locations, independent of wrist/finger poses."""
+    """open/add/pick/edit/remove/select/use_palm/save exact operating grab locations; every argument goes in values. add takes pointInSource[3] (the operating part's own frame, as describe_weapon's grabPoints.candidates give it) with optional name, radiusGame (the candidate's suggestedRadius) and handMask, and needs no viewport; remove and select take id; pick takes viewport x/y and optional replace; edit takes id, name, pointInSource[3], radiusGame and handMask (left=1/right=2/both=3). Exports use kind=grab_locations. These are game acquisition locations, independent of wrist/finger poses."""
     return command('grab_locations',dict(values or {},operation=operation),expected_revision)
 
 @mcp.tool()
@@ -747,8 +810,25 @@ def get_holding_geometry() -> dict:
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('--command',help='One JSON request to the local application')
+    parser.add_argument('--call',help='Call one tool of this adapter by name and print its reply; --list names them')
+    parser.add_argument('--arguments',default='{}',help='The tool arguments as one JSON object')
+    parser.add_argument('--list',action='store_true',help='Print every tool with its description')
     args=parser.parse_args()
-    if args.command:
+    if args.list or args.call:
+        import asyncio
+        tools={tool.name:tool for tool in asyncio.run(mcp.list_tools())}
+        if args.list:
+            for name,tool in sorted(tools.items()):print(name+'\n    '+' '.join((tool.description or '').split())+'\n')
+        elif args.call not in tools:
+            raise SystemExit('Unknown tool '+args.call+'; use --list')
+        else:
+            arguments=json.loads(args.arguments)
+            # An edit takes the revision it was written against; outside a client that tracks it, use the current one.
+            if 'expected_revision' in tools[args.call].inputSchema.get('properties',{}) and 'expected_revision' not in arguments:
+                arguments['expected_revision']=command('revision')['revision']
+            reply=globals()[args.call](**arguments)
+            print(reply.path if isinstance(reply,Image) else json.dumps(reply,indent=1))
+    elif args.command:
         request=json.loads(args.command)
         print(json.dumps(command(request['method'],request.get('params'),request.get('expectedRevision'))))
     else: mcp.run()
