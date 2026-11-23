@@ -164,7 +164,8 @@ def _capture(request, parent, root, backends):
         # Captures must outlive child workspace cleanup; only these files move
         # into the parent job. Source models and authoring records stay intact.
         for record, folder in result['captureFolders'].items():
-            source=Path(folder).resolve();require(source.is_relative_to(root),'Foreign capture result')
+            # Both sides resolved: the workspace's local folder may be a link to another drive.
+            source=Path(folder).resolve();require(source.is_relative_to(root.resolve()),'Foreign capture result')
             destination=parent/'captures'/record.replace(':','-')
             destination.parent.mkdir(parents=True,exist_ok=True)
             require(not destination.exists(),'Capture result destination already exists: '+str(destination))
