@@ -28,7 +28,8 @@ FREE_ABOVE = 1.0          # a finger that stood this clear on a borrowed fit is 
 # magazine's length toward the weapon. A wrist farther in holds the end that goes into the weapon.
 WRONG_END = -0.4
 STICKS_OUT = 1.5          # a finger on the magazine whose end is this far off it points away from it
-WEAPON_SINK = 0.5         # how deep the hand may enter the weapon when the magazine is seated
+# How deep the hand may enter the weapon when the magazine is seated: 95% of the saved fits stay within 1.1.
+WEAPON_SINK = 1.1
 WEAPON_PAD = 7.0          # the weapon is measured this far around the seated magazine
 PER_SEGMENT = 24          # skin points kept per finger segment
 PER_PALM = 90
@@ -578,20 +579,22 @@ def brief(report):
     return {k: report[k] for k in ('verdict', 'touching', 'hovering', 'buried')}
 
 
-def judged(report, scene, hand_frame, in_weapon):
+def judged(report, scene, hand_frame, in_weapon, proposed=True):
     """A measured hand as a candidate: the contact, where it sits along the magazine, what is wrong and a score.
 
     Contact alone cannot tell a hand on the magazine's base from one closed on
     the end that goes into the weapon, or a finger lying on the magazine from
-    one that only touches it at the knuckle and points away.
+    one that only touches it at the knuckle and points away. Those two readings
+    rank and mark a proposed hand only: a saved fit keeps its contact verdict,
+    since one in twenty accepted fits has its wrist toward the weapon.
     """
     along = round(unapply(scene.box, hand_frame[0])[0] / max(scene.size[0], 0.1), 2)
     sticking = [finger for finger in FINGERS if report['fingers'][finger]['whole']['state'] == 'touching' and
                 (report['fingers'][finger]['tip'].get('deepest') is None or report['fingers'][finger]['tip']['deepest'] > STICKS_OUT)]
     verdict = report['verdict']
-    if along < WRONG_END:
+    if proposed and along < WRONG_END:
         verdict = 'holds the end that goes into the weapon'
-    elif verdict == 'holds' and len(report['touching']) - len(sticking) < 3:
+    elif proposed and verdict == 'holds' and len(report['touching']) - len(sticking) < 3:
         verdict = 'fingers point away from the magazine'
     score = hold_score(report) - len(sticking) - (4 if along < WRONG_END else 0)
     if in_weapon is not None:
@@ -702,7 +705,7 @@ def show(command, hands=('left', 'right')):
             view = scene.look()
             report = contact(view['geometry'], view['pose'], view['magazine'], side, scene.field.surface)
             rows.append(('%s hand: %s' % (side, report['verdict']), pictures(editor, scene, view, report, '%s hand' % side)))
-            result[side] = {**judged(report, scene, view['hand'], scene.clearance(view, scene.anchor(view['pose'], held.anchor))),
+            result[side] = {**judged(report, scene, view['hand'], scene.clearance(view, scene.anchor(view['pose'], held.anchor)), proposed=False),
                             'fit': held.grip.get('name')}
     if rows:
         result['sheet'] = sheet(editor, rows, 'Magazine held in Operate   green = touching, yellow = gap, red = sunk into the magazine')
