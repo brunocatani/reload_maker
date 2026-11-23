@@ -269,6 +269,25 @@ def choose_grab_point(number: int) -> dict:
     return guided.choose_grab(command, STORE, number)
 
 @mcp.tool()
+def set_operating_part(part: str, moves_with: list[str] | None = None, bolt: str = '', magazine: str = '',
+                       unfolded_seconds: float | None = None, pulled_seconds: float | None = None,
+                       returned_seconds: float | None = None):
+    """Make a named moving part the one a hand works, for a weapon whose charging
+    handle is its own part (describe_weapon reload.movingTracks names the parts),
+    and return one picture of it taken hold of and pulled. moves_with: parts that
+    travel rigidly with the handle, never the bolt of an independent handle. bolt
+    and magazine name those parts when the preset has not found them. The
+    moments are seconds of the reload clip: pulled_seconds when the pull is at
+    its farthest, and unfolded_seconds, only for a handle that swings out before
+    the pull, when it is fully out and not yet pulled. returned_seconds is found
+    by measurement (the first moment the part is back at rest) unless given.
+    Whether the handle is independent of the bolt is measured from the bolt's
+    position at the unfolded moment."""
+    import guided
+    return _pictured(guided.operating_part(command, part, tuple(moves_with or ()), bolt, magazine, unfolded_seconds, pulled_seconds,
+                                           returned_seconds))
+
+@mcp.tool()
 def author_operating_fingers() -> dict:
     """Give the operating part its finger shape for both hands in one call: the
     fingers of the hand that works it in the weapon's own reload, at the moment

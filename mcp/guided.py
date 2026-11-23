@@ -96,6 +96,98 @@ def choose_grab(command, store, number):
     return {'added': number, 'pointsNow': len(points), 'next': 'Call next_step.'}
 
 
+# --- which part a hand works ------------------------------------------------------------------------------
+
+def operating_part(command, part, moves_with=(), bolt='', magazine='', unfolded_seconds=None, pulled_seconds=None, returned_seconds=None):
+    """Make a named part the one a hand works, and show it pulled.
+
+    For a weapon whose charging handle is its own part: `moves_with` names the
+    parts that travel rigidly with the handle (never the bolt of an independent
+    handle). `bolt` and `magazine` name those parts where the preset has not
+    found them. The three moments are seconds of the reload clip. `unfolded_seconds`
+    is for a handle that swings out before it is pulled: the moment it is fully
+    out and not yet pulled; Maker then deploys it when grabbed. The bolt's own
+    position at that moment tells whether the handle is independent of it.
+    """
+    editor = Editor(command)
+    setup = editor.read('operating_setup_state')
+    settings = dict(setup['settings'])
+    names = [anchor['name'] for anchor in settings['trackAnchors']]
+    missing = [name for name in (part, bolt, magazine) + tuple(moves_with) if name and name not in names]
+    if missing:
+        raise RuntimeError('This weapon has no moving part named %s. Its moving parts are: %s' % (', '.join(missing), ', '.join(names)))
+    for role, name in (('bolt', bolt), ('magazine', magazine)):
+        if name:
+            settings[role] = names.index(name)
+        elif settings.get(role, -1) < 0:
+            raise RuntimeError('Maker has not found the %s of this weapon; name it with the "%s" argument' % (role, role))
+    reload_clip = next((clip for clip in setup['clips'] if clip['name'] == 'Reload'), None)
+    if reload_clip is None:
+        raise RuntimeError('This weapon has no reload clip to take the movement from')
+    report = {'part': part, 'movesWith': list(moves_with)}
+    action = next(a['index'] for a in editor.read('state', {'fields': ['actions']})['actions'] if a['path'].lower() == reload_clip['path'].lower())
+    editor.edit('workspace', {'index': 2, 'handsPage': 0})
+    editor.edit('action', {'index': action})
+
+    def where(name, seconds):
+        editor.edit('playback', {'seconds': seconds, 'playing': False})
+        return fitting.weapon_local(editor.read('pose'), name)[0]
+
+    if pulled_seconds is not None and returned_seconds is None:
+        # The stroke ends where the part first comes back to rest; a part that settles afterwards
+        # would make the stroke run backwards.
+        rest, seconds = where(part, 0.0), pulled_seconds
+        away = math.dist(where(part, pulled_seconds), rest)
+        while seconds < setup['duration'] and math.dist(where(part, seconds), rest) > 0.05 * away:
+            seconds += 0.025
+        returned_seconds = report['returnedSeconds'] = round(seconds, 3)
+    settings.update(version=2, mode='clip', clip=reload_clip['path'], baseline=reload_clip['baseline'], operating=names.index(part),
+                    followers=[names.index(name) for name in (part,) + tuple(moves_with)],
+                    openSeconds=-1 if pulled_seconds is None else pulled_seconds,
+                    closedSeconds=-1 if returned_seconds is None else returned_seconds)
+    if unfolded_seconds is not None:
+        bolt = report['bolt'] = names[settings['bolt']]
+        report['boltWhenUnfolded'] = round(math.dist(where(bolt, 0.0), where(bolt, unfolded_seconds)), 2)
+        # A bolt already back while the handle is still forward does not carry the handle.
+        settings.update(grabDeploySeconds=unfolded_seconds, grabDeployIndependent=report['boltWhenUnfolded'] > 2.0 and bolt != part)
+        report['independentOfBolt'] = settings['grabDeployIndependent']
+    editor.edit('operating_setup', {'operation': 'save', 'settings': settings})
+    saved = editor.read('operating_setup_state')
+    if saved.get('error'):
+        raise RuntimeError('Maker did not accept this operating setup: ' + saved['error'])
+    # Shown as a hand would feel it: taken hold of, then pulled along the straight stroke.
+    editor.edit('workspace', {'index': 5})
+    editor.edit('simulate', {'operation': 'reset'})
+    stroke = editor.read('simulation_state').get('controllerInput', {}).get('strokeInWeapon') or [0.0, 0.0, 0.0]
+    report['pullLength'] = round(math.hypot(*stroke), 2)
+    # Framed on the shapes that ride these parts; a part's own origin can lie far from what it draws.
+    shapes = [mesh for mesh in perception.describe(command, hands=False)['meshes'] if mesh['rides'] in (part,) + tuple(moves_with)]
+    if not shapes:
+        raise RuntimeError('No drawn shape rides %s, so there is nothing for a hand to take hold of' % part)
+    low, high = bounds([[mesh['centre'][i] + side * mesh['size'][i] / 2 for i in range(3)] for mesh in shapes for side in (-1, 1)])
+    report['shapes'] = [mesh['name'] for mesh in shapes]
+    focus = [[x, y, z] for x in (low[0] - 5, high[0] + 5) for y in (low[1] - 5 - report['pullLength'], high[1] + 5) for z in (low[2] - 5, high[2] + 5)]
+    panels = []
+    for share, label in ((None, 'at rest, nobody holding it'), (0.0, 'taken hold of, not pulled'), (0.5, 'pulled half way'),
+                         (1.0, 'pulled all the way')):
+        if share is not None:
+            editor.edit('simulate', {'operation': 'controller_pull', 'position': [value * share for value in stroke]})
+        for view in ('left', 'top'):
+            path = editor.read('render', {'view': view, 'focus': focus, 'preserveCamera': True, 'caption': '%s   %s view' % (label, view)})['path']
+            panels.append({'path': path, 'label': '%s  %s' % (label, view)})
+    editor.edit('simulate', {'operation': 'release'})
+    editor.edit('simulate', {'operation': 'reset'})
+    report['sheet'] = editor.read('picture_sheet', {'panels': panels, 'columns': 2, 'cellWidth': 640,
+                                                    'title': 'The %s taken hold of and pulled %.1f units' % (part, report['pullLength'])})['path']
+    report['look'] = ['Row 1 is the weapon at rest; rows 2 to 4 are a hand holding the part, at three amounts of pull. '
+                      'Each is seen from the left side and from above.',
+                      'In row 2 the part must be in its row 1 place, or folded out from it; in rows 3 and 4 it must move back with the pull.',
+                      'A folding part is folded in row 1: in the game it folds out as a hand comes near.',
+                      'A part that jumps, stays folded in row 2, or leaves the weapon is a fault: report it.']
+    report['next'] = 'Call next_step.'
+    return report
+
+
 # --- operating fingers ---------------------------------------------------------------------------------
 
 def operating_fingers(command):

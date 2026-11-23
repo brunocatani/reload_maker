@@ -41,11 +41,12 @@ Pick the row like this, in order:
 2. Throw out every row with a red dot.
 3. Throw out every row where the hand is closed on the end that goes into the weapon. That end is open and shows a cartridge (brass or a coloured tip), or on an energy cell its contacts. The hand belongs on the other end, the closed base.
 4. Throw out every row with a finger pointing straight out into the air, or with the wrist passing through the magazine.
-5. Of the rows left, take the one with the most green dots.
-6. If rows tie, take the lowest number.
-7. If no row is left, take row 1.
+5. Throw out every row where the hand only pinches the magazine between its fingertips, if another row wraps the fingers around the body.
+6. Of the rows left, take the one with the most green dots.
+7. If rows tie, take the lowest number.
+8. If no row is left, take row 1.
 
-The rows are numbered best first by the tool's own measurement (`score` in the reply's `candidates`), so the lowest number left after rules 1 to 4 is the tool's preference too. The picture decides what is thrown out; the number decides ties. When the picture is unclear, choose row 1.
+The rows are numbered best first by the tool's own measurement (`score` in the reply's `candidates`), so the lowest number left after rules 1 to 5 is the tool's preference too. The picture decides what is thrown out; the number decides ties. When the picture is unclear, choose row 1.
 
 ## Correcting a saved fit (`nudge_magazine_fit`)
 
@@ -69,6 +70,20 @@ Numbered dots sit on the part a hand works: a charging handle, a bolt handle or 
 2. Do not pick a dot on the receiver body, the barrel, the stock or the magazine.
 3. If several dots are on the handle, pick the lowest number.
 4. If you cannot tell, pick 1.
+
+## Naming the part the hand works (`set_operating_part`)
+
+Only when you were told which parts to name, or `next_step` asks for it. One call sets the charging handle, what moves with it, the bolt and the magazine, from the reload clip:
+
+`set_operating_part` with `{"part": "<handle>", "moves_with": ["<part>", ...], "bolt": "<bolt>", "magazine": "<magazine>", "unfolded_seconds": <s>, "pulled_seconds": <s>}`
+
+- `pulled_seconds` is the moment of the reload clip where the handle is farthest back. The tool finds the moment it is home again by itself.
+- `unfolded_seconds` is only for a handle that swings or folds out before it is pulled: the moment it is fully out and not yet pulled. Leave it out for a handle that does not fold.
+- `bolt` and `magazine` are needed only when the reply says Maker has not found them.
+
+The reply's picture has four rows: the weapon at rest, then a hand holding the part at no pull, half pull and full pull. Continue only if the part is in the same place in rows 1 and 2 or folded out in row 2, and moves toward the stock in rows 3 and 4. Otherwise stop and report.
+
+A folding handle is drawn folded in row 1. In the game it unfolds as a hand comes near it, so the hand takes it already folded out.
 
 ## What to report at the end
 
