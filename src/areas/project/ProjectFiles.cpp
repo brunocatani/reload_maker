@@ -386,7 +386,7 @@ namespace reloadmaker
         const auto* weapon = currentWeapon();
         QJsonObject record{ { "format", 1 },
                             { "kind", "reload-maker-v2-project" },
-                            { "package", _package.sourcePath },
+                            { "package", workspaceStoredPath(_package.sourcePath) },
                             { "gameData", _gameData },
                             { "weaponName", weapon->name.isEmpty() ? weapon->editorId : weapon->name },
                             { "weaponEditorId", weapon->editorId },

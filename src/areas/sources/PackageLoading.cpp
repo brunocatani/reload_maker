@@ -244,7 +244,7 @@ namespace reloadmaker
 
         QString package = packagePath;
         if (package.isEmpty()) {
-            package = settings.value("paths/lastPackage").toString();
+            package = workspaceResolvedPath(settings.value("paths/lastPackage").toString());
         }
         if (!package.isEmpty() && QFileInfo(package).exists()) {
             _packageText = package;
@@ -386,7 +386,7 @@ namespace reloadmaker
             _gameDataText = _gameData;
             QSettings settings;
             settings.setValue("paths/gameData", _gameData);
-            settings.setValue("paths/lastPackage", _package.sourcePath);
+            settings.setValue("paths/lastPackage", workspaceStoredPath(_package.sourcePath));
 
             clearDiagnostics();
             for (const PluginContent& plugin : _plugins) {

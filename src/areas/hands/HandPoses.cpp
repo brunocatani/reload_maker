@@ -2,6 +2,7 @@
 // capturing the current hand into the library, previewing a saved pose's
 // fingers, editing finger joints, and restoring the native animation.
 #include "ReloadMakerController.h"
+#include "StudioPaths.h"
 #include "GripViewport.h"
 #include "model/nifmodel.h"
 
@@ -313,7 +314,7 @@ namespace reloadmaker
             { "body", _armsBody },
             { "viewMode", motionModeName() },
             { "approximateTransitions", _approximateTransitions },
-            { "resourceProvider", _libraryMode ? _packageResources.provider(_activeAnimationPath) : _package.sourcePath },
+            { "resourceProvider", _libraryMode ? _packageResources.provider(_activeAnimationPath) : workspaceStoredPath(_package.sourcePath) },
         };
     }
 

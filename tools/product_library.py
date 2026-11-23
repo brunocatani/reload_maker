@@ -581,9 +581,19 @@ def remember_bench_source(workspace, source, weapons):
     """A weapon saved from the developer's dev bench appears in its testbed list
     with that source. The list names sources only, never authoring."""
     package = str(source.get('package') or '')
-    bench = str((Path(workspace).resolve()/'local/devbench')).replace('\\', '/').lower()+'/'
+    root = Path(workspace).resolve()
+    bench = str(root/'local/devbench').replace('\\', '/').lower()+'/'
     if source.get('mode') != 'package' or not package:
         return
+    # A source inside the workspace is named from the workspace root, so the
+    # list survives the workspace being moved or renamed.
+    stored = package
+    if Path(package).is_absolute():
+        try:
+            stored = Path(package).resolve().relative_to(root).as_posix()
+        except ValueError:
+            pass
+    package = str(root/package) if not Path(package).is_absolute() else package
     from product_library_migrate import bench_source
     if not bench_source(package, bench):
         return
@@ -593,7 +603,7 @@ def remember_bench_source(workspace, source, weapons):
     for record, change in weapons.items():
         plugin, local = record.split(':')
         slug = re.sub(r'[^a-z0-9]+', '-', Path(plugin).stem.lower()+'-'+local.lower())
-        entries['bench-'+slug] = dict(id='bench-'+slug, weapon=record, source=package, bench=True,
+        entries['bench-'+slug] = dict(id='bench-'+slug, weapon=record, source=stored, bench=True,
                                       gameData=str(source.get('gameData', '')), plugin=plugin, name=change.get('name') or record)
     value['sources'] = sorted(entries.values(), key=lambda e: (e.get('bench', False), e['id']))
     write(registry, value)

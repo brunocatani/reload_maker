@@ -3,6 +3,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QRegularExpression>
 
@@ -101,6 +102,16 @@ namespace reloadmaker
         }
         QString error;
         auto sources = readJson(path, 1024 * 1024, error);
-        return sources["format"] == QLatin1String("reload-maker-development-sources") ? sources : QJsonObject{};
+        if (sources["format"] != QLatin1String("reload-maker-development-sources")) {
+            return {};
+        }
+        auto entries = sources["sources"].toArray();
+        for (int i = 0; i < entries.size(); ++i) {
+            auto entry = entries[i].toObject();
+            entry["source"] = workspaceResolvedPath(entry["source"].toString());
+            entries[i] = entry;
+        }
+        sources["sources"] = entries;
+        return sources;
     }
 }

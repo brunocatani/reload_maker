@@ -1020,7 +1020,7 @@ namespace reloadmaker
                 source["mo2Instance"] = _launchSnapshot.instancePath;
                 source["profile"] = _launchSnapshot.profileName;
             } else {
-                source["package"] = _package.sourcePath;
+                source["package"] = workspaceStoredPath(_package.sourcePath);
             }
             const QJsonObject request{ { "format", "reload-maker-library-save-request" },
                                        { "version", 1 },
@@ -1267,7 +1267,8 @@ namespace reloadmaker
             return { { "imported", true }, { "weapon", weapon }, { "source", "current" } };
         }
         // The weapon is not in this source: open the project's own source.
-        require(QFileInfo(record["gameData"].toString()).isDir() && (record["library"].toBool() || QFileInfo(record["package"].toString()).exists()),
+        const auto package = workspaceResolvedPath(record["package"].toString());
+        require(QFileInfo(record["gameData"].toString()).isDir() && (record["library"].toBool() || QFileInfo(package).exists()),
                 "The project's source is missing. Connect a source that contains this weapon, then import it again.");
         if (!leaveDocument(QStringLiteral("opening the imported project's source"))) {
             return { { "imported", false } };
@@ -1281,7 +1282,7 @@ namespace reloadmaker
             _requestedMo2Profile = record["mo2Profile"].toString();
             startLibraryLoad(true);
         } else {
-            startPackageLoad(record["package"].toString(), record["gameData"].toString(), true);
+            startPackageLoad(package, record["gameData"].toString(), true);
         }
         if (!_loadThread) {
             _pendingSession = {};
@@ -1425,7 +1426,7 @@ namespace reloadmaker
             last["mo2Instance"] = _launchSnapshot.instancePath;
             last["profile"] = _launchSnapshot.profileName;
         } else {
-            last["package"] = _package.sourcePath;
+            last["package"] = workspaceStoredPath(_package.sourcePath);
         }
         QSettings().setValue("session/last", QString::fromUtf8(QJsonDocument(last).toJson(QJsonDocument::Compact)));
     }
@@ -1443,8 +1444,8 @@ namespace reloadmaker
             _mo2Instance = last["mo2Instance"].toString(_mo2Instance);
             _requestedMo2Profile = last["profile"].toString();
             startLibraryLoad(true);
-        } else if (QFileInfo::exists(last["package"].toString())) {
-            startPackageLoad(last["package"].toString(), last["gameData"].toString(), true);
+        } else if (QFileInfo::exists(workspaceResolvedPath(last["package"].toString()))) {
+            startPackageLoad(workspaceResolvedPath(last["package"].toString()), last["gameData"].toString(), true);
         }
         if (!_loadThread) {
             _pendingSession = {};

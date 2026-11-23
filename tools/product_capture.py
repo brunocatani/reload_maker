@@ -92,6 +92,10 @@ def _capture(request, parent, root, backends):
         weapons=sorted(request['weapons'].items(),key=lambda row:row[0]==request.get('refreshWeapon'))
         for record, authoring in weapons:
             progress('load-capture-source',weapon=record)
+            # The worker has its own workspace root; a source named from the
+            # owning workspace's root is given to it in full.
+            package=str(authoring.get('package') or '')
+            if package and not Path(package).is_absolute():authoring=dict(authoring,package=str(workspace/package))
             if request.get('operation')=='review_magazine':
                 authoring=dict(authoring,showArms=True)
                 authoring['holdingPreview']={**authoring.get('holdingPreview',{}),'enabled':False,'replay':False}
