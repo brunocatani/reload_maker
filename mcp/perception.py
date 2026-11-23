@@ -20,8 +20,10 @@ RIGID_RESIDUAL = 0.05     # a mesh follows a track when the track's motion expla
 HOLD_REACH = 6.0          # a palm this close to a part's surface is holding or working it
 CARRIED = 3.0             # a part this far from where the clip starts it has left its seat
 WITH_PART = 0.15          # seconds a palm must stay at an unseated part to be moving it
-TOUCH = 0.3               # a hand surface this close to the part counts as touching
-BURIED = -0.7             # a hand surface this far inside the part is clearly sunk into it
+# Drawn from the saved magazine fits of 138 authored weapons: 95% have three or more fingers within
+# 0.5 of the surface, their fingers typically sink 0.3 to 0.7, and only a few sink deeper than 1.3.
+TOUCH = 0.5               # a finger whose skin comes this close to the part is on it
+BURIED = -1.3             # skin this far inside the part is sunk into it
 FINGERS = ('thumb', 'index', 'middle', 'ring', 'little')
 _NEAREST_JOINT = {}       # per hand mesh, the joint each vertex is nearest to
 
@@ -198,64 +200,156 @@ def closest_on_triangle(p, a, b, c):
 class Surface:
     """Triangles of one or more meshes in a uniform grid, for distance queries."""
 
-    def __init__(self, meshes, cell=1.5):
-        self.cell = cell
+    SHELL_CELL = 0.5
+    EXACT_WITHIN = 1.5
+
+    def __init__(self, meshes, reach=3.0, region=None):
+        """Distances are answered up to `reach` from the surface, exactly within EXACT_WITHIN of it.
+        `region` (low, high) limits the surface to where it will be asked about, for a large weapon
+        of which only the part around the magazine matters."""
+        cell = self.cell = self.SHELL_CELL
+        self.solid = region is not None
         self.triangles = []
-        volume = 0.0
-        # Measured about the meshes' own middle, so an open shell reads the same wherever it is.
-        every = [v for mesh in meshes for v in mesh['vertices']]
-        middle = [sum(v[i] for v in every) / len(every) for i in range(3)] if every else [0.0, 0.0, 0.0]
+        # Per mesh and per axis, its triangles flattened along that axis, for counting what a ray crosses.
+        self.shells = []
+        size = self.SHELL_CELL
         for mesh in meshes:
             vertices = mesh['vertices']
+            if region and vertices:
+                low, high = bounds(vertices)
+                if any(high[i] < region[0][i] or low[i] > region[1][i] for i in range(3)):
+                    continue
+            shell = ({}, {}, {})
             for i, j, k in mesh['triangles']:
                 a, b, c = vertices[i], vertices[j], vertices[k]
                 n = [(b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
                      (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
                      (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])]
-                length = math.hypot(*n)
-                if length < 1e-12:
+                if math.hypot(*n) < 1e-12:
                     continue
-                volume += (a[0] - middle[0]) * n[0] + (a[1] - middle[1]) * n[1] + (a[2] - middle[2]) * n[2]
-                self.triangles.append((a, b, c, [n[0] / length, n[1] / length, n[2] / length]))
-        # Outward normals give a positive enclosed volume; a mesh wound the other way is flipped.
-        self.outward = 1.0 if volume >= 0 else -1.0
+                if not region or all(max(a[i], b[i], c[i]) >= region[0][i] and min(a[i], b[i], c[i]) <= region[1][i] for i in range(3)):
+                    self.triangles.append((a, b, c))
+                for axis in range(3):
+                    u, v = (axis + 1) % 3, (axis + 2) % 3
+                    det = (b[u] - a[u]) * (c[v] - a[v]) - (c[u] - a[u]) * (b[v] - a[v])
+                    if abs(det) < 1e-12:
+                        continue
+                    # A ray leaves the region through whatever lies beyond it, so every triangle over the
+                    # region's footprint is kept, but only in the cells a point inside the region can ask about.
+                    spans = []
+                    for w in (u, v):
+                        lowest, highest = min(a[w], b[w], c[w]), max(a[w], b[w], c[w])
+                        if region:
+                            lowest, highest = max(lowest, region[0][w]), min(highest, region[1][w])
+                        spans.append((int(math.floor(lowest / size)), int(math.floor(highest / size))))
+                    if spans[0][0] > spans[0][1] or spans[1][0] > spans[1][1] or (region and max(a[axis], b[axis], c[axis]) < region[0][axis]):
+                        continue
+                    flat = (a[u], a[v], b[u] - a[u], b[v] - a[v], c[u] - a[u], c[v] - a[v], 1 / det, a[axis], b[axis] - a[axis], c[axis] - a[axis])
+                    for x in range(spans[0][0], spans[0][1] + 1):
+                        for y in range(spans[1][0], spans[1][1] + 1):
+                            shell[axis].setdefault((x, y), []).append(flat)
+            self.shells.append(shell)
         self.grid = {}
-        for index, (a, b, c, _) in enumerate(self.triangles):
+        for index, (a, b, c) in enumerate(self.triangles):
             low = [int(math.floor(min(a[i], b[i], c[i]) / cell)) for i in range(3)]
             high = [int(math.floor(max(a[i], b[i], c[i]) / cell)) for i in range(3)]
             for x in range(low[0], high[0] + 1):
                 for y in range(low[1], high[1] + 1):
                     for z in range(low[2], high[2] + 1):
                         self.grid.setdefault((x, y, z), []).append(index)
+        # Every cell within reach knows a nearby cell that holds surface, spread outward from the surface
+        # once. A query then starts from a real triangle instead of searching outward for one.
+        self.reach = reach
+        limit = (reach / cell + 2) ** 2
+        self.toward = {key: key for key in self.grid}
+        frontier = list(self.grid)
+        while frontier:
+            following = []
+            for key in frontier:
+                seed = self.toward[key]
+                for dx, dy, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                    other = (key[0] + dx, key[1] + dy, key[2] + dz)
+                    squared = (other[0] - seed[0]) ** 2 + (other[1] - seed[1]) ** 2 + (other[2] - seed[2]) ** 2
+                    if squared > limit:
+                        continue
+                    known = self.toward.get(other)
+                    if known is None or squared < (other[0] - known[0]) ** 2 + (other[1] - known[1]) ** 2 + (other[2] - known[2]) ** 2:
+                        self.toward[other] = seed
+                        following.append(other)
+            frontier = following
 
-    def distance(self, point, reach=HOLD_REACH * 2):
-        """Signed distance to the surface (negative inside), or None beyond `reach`."""
-        if not self.triangles:
+    def distance(self, point, reach=None):
+        """Signed distance to the surface (negative inside), or None beyond `reach` (at most the surface's own)."""
+        cell = self.cell
+        reach = self.reach if reach is None else min(reach, self.reach)
+        home = (int(math.floor(point[0] / cell)), int(math.floor(point[1] / cell)), int(math.floor(point[2] / cell)))
+        seed = self.toward.get(home)
+        if seed is None:
             return None
-        home = [int(math.floor(point[i] / self.cell)) for i in range(3)]
-        best, best_sign, seen = None, 1.0, set()
-        for ring in range(int(reach / self.cell) + 2):
-            if best is not None and best < (ring - 1) * self.cell:
-                break
-            for x in range(home[0] - ring, home[0] + ring + 1):
-                for y in range(home[1] - ring, home[1] + ring + 1):
-                    for z in range(home[2] - ring, home[2] + ring + 1):
-                        if max(abs(x - home[0]), abs(y - home[1]), abs(z - home[2])) != ring:
-                            continue
-                        for index in self.grid.get((x, y, z), ()):
+        triangles = self.triangles
+        best, seen = None, set()
+        for index in self.grid[seed]:
+            seen.add(index)
+            a, b, c = triangles[index]
+            d = math.dist(point, closest_on_triangle(point, a, b, c))
+            if best is None or d < best:
+                best = d
+        if best > self.EXACT_WITHIN:
+            # Far from the surface the nearby cell's own triangles are answer enough: the true distance is
+            # at most a cell's diagonal less, so such a point is in no case touching. Only a thick solid
+            # can hold a point this deep, which a magazine is not.
+            if best > reach:
+                return None
+            return -best if self.solid and self.inside(point) else best
+        # Nothing nearer can lie in a cell farther out than the distance already found.
+        ring = 0
+        while (ring - 1) * cell < best:
+            low, high = -ring, ring
+            for x in range(low, high + 1):
+                edge_x = x == low or x == high
+                for y in range(low, high + 1):
+                    for z in (range(low, high + 1) if edge_x or y == low or y == high else (low, high) if ring else (0,)):
+                        for index in self.grid.get((home[0] + x, home[1] + y, home[2] + z), ()):
                             if index in seen:
                                 continue
                             seen.add(index)
-                            a, b, c, n = self.triangles[index]
-                            q = closest_on_triangle(point, a, b, c)
-                            d = math.dist(point, q)
-                            if best is None or d < best:
+                            a, b, c = triangles[index]
+                            d = math.dist(point, closest_on_triangle(point, a, b, c))
+                            if d < best:
                                 best = d
-                                side = (point[0] - q[0]) * n[0] + (point[1] - q[1]) * n[1] + (point[2] - q[2]) * n[2]
-                                best_sign = -1.0 if side * self.outward < 0 else 1.0
-        if best is None or best > reach:
+            ring += 1
+        if best > reach:
             return None
-        return best * best_sign
+        return -best if self.inside(point) else best
+
+    def inside(self, point):
+        """Whether the point is within the material of any mesh.
+
+        A ray from the point crosses a closed skin an odd number of times when
+        it starts inside. Three rays vote, so an open end or a ray along an
+        edge does not decide alone; how the mesh is wound plays no part.
+        """
+        for shell in self.shells:
+            votes = 0
+            for axis in range(3):
+                # A hair off the grid, so a ray never runs exactly along a shared edge.
+                pu, pv, pw = point[(axis + 1) % 3] + 1.37e-4, point[(axis + 2) % 3] + 2.11e-4, point[axis]
+                crossings = 0
+                for au, av, bu, bv, cu, cv, inverse, aw, bw, cw in shell[axis].get(
+                        (int(math.floor(pu / self.SHELL_CELL)), int(math.floor(pv / self.SHELL_CELL))), ()):
+                    du, dv = pu - au, pv - av
+                    s = (du * cv - cu * dv) * inverse
+                    if s < 0 or s > 1:
+                        continue
+                    t = (bu * dv - du * bv) * inverse
+                    if t < 0 or s + t > 1:
+                        continue
+                    if aw + s * bw + t * cw > pw:
+                        crossings += 1
+                votes += crossings & 1
+            if votes >= 2:
+                return True
+        return False
 
 
 def rigid(mesh):
@@ -467,14 +561,12 @@ def hand_timeline(reload, clip, parts, step):
 
 # --- contact of a displayed hand -------------------------------------------------------------------
 
-def contact(geometry, pose, target_meshes, side):
-    """How the displayed hand sits on the target: per finger and palm, the gap to its surface."""
+def hand_groups(geometry, pose, side):
+    """The displayed hand's skin vertices by the joint they belong to: Hand, Finger11 ... Finger53."""
     prefix = 'LArm_' if side == 'left' else 'RArm_'
     bones = weapon_local_bones(pose)
     joints = [(name, position) for name, position in bones.items()
               if (name.startswith('LArm_') or name.startswith('RArm_')) and ('Finger' in name or name.endswith('_Hand'))]
-    surface = Surface(target_meshes)
-    low, high = bounds([v for mesh in target_meshes for v in mesh['vertices']])
     groups = {}
     for mesh in hand_meshes(geometry):
         # Skin never changes which joint a vertex is nearest to, so each hand mesh is sorted once.
@@ -487,17 +579,25 @@ def contact(geometry, pose, target_meshes, side):
                 groups.setdefault(name[len(prefix):], []).append(vertex)
     if not groups:
         raise RuntimeError('No hand surface is drawn; show the arms and the hand fit first')
+    return groups
+
+
+def contact(geometry, pose, target_meshes, side, surface=None):
+    """How the displayed hand sits on the target: per finger and palm, the gap to its surface.
+
+    `surface` is the target's Surface when the caller already has it and the target has not moved.
+    """
+    groups = hand_groups(geometry, pose, side)
+    surface = surface or Surface(target_meshes)
 
     def measure(vertices):
-        near = [v for v in vertices if all(low[i] - HOLD_REACH <= v[i] <= high[i] + HOLD_REACH for i in range(3))]
-        gaps = [g for g in (surface.distance(v, reach=HOLD_REACH) for v in near) if g is not None]
+        gaps = [g for g in (surface.distance(v) for v in vertices) if g is not None]
         if not gaps:
             return {'gap': None, 'state': 'away'}
         nearest = min(gaps, key=abs)
         deepest = min(gaps)
-        state = 'buried' if deepest < BURIED else 'touching' if min(abs(g) for g in gaps) <= TOUCH or deepest < 0 else 'hovering'
         return {'gap': round(nearest, 2), 'deepest': round(deepest, 2), 'touchingVertices': sum(1 for g in gaps if abs(g) <= TOUCH),
-                'state': state}
+                'state': part_state(deepest)}
 
     fingers = {}
     for number, finger in enumerate(FINGERS, start=1):
@@ -508,11 +608,23 @@ def contact(geometry, pose, target_meshes, side):
     touching = [f for f in FINGERS if fingers[f]['whole']['state'] == 'touching']
     hovering = [f for f in FINGERS if fingers[f]['whole']['state'] in ('hovering', 'away')]
     buried = [f for f in FINGERS if fingers[f]['whole']['state'] == 'buried']
-    verdict = 'holds' if len(touching) >= 3 and not buried and palm['state'] != 'away' else \
-              'sunk into the part' if buried or palm['state'] == 'buried' else 'not gripping'
-    return {'hand': side, 'verdict': verdict, 'touching': touching, 'hovering': hovering, 'buried': buried,
+    return {'hand': side, 'verdict': hold_verdict(len(touching), bool(buried) or palm['state'] == 'buried'),
+            'touching': touching, 'hovering': hovering, 'buried': buried,
             'palm': palm, 'fingers': fingers, 'units': 'game units; negative is inside the part',
-            'thresholds': {'touching': TOUCH, 'buried': BURIED}}
+            'thresholds': {'touching': TOUCH, 'buried': BURIED,
+                           'meaning': 'holds is three or more fingers on the surface and nothing sunk, as the saved fits of the '
+                                      'authored weapons measure; the palm rarely touches a magazine and is not required'}}
+
+
+def part_state(deepest):
+    """Of a finger or palm, from the closest its skin comes to the part (negative is inside it)."""
+    if deepest is None:
+        return 'away'
+    return 'buried' if deepest < BURIED else 'touching' if deepest <= TOUCH else 'hovering'
+
+
+def hold_verdict(fingers_on, sunk):
+    return 'sunk into the part' if sunk else 'holds' if fingers_on >= 3 else 'not gripping'
 
 
 # --- where a hand can take hold of a moving part ----------------------------------------------------
@@ -614,11 +726,11 @@ def describe(command, hands=True):
             parts = {}
             magazine_meshes = [m for m in rest['meshes'] if m['block'] in magazine_blocks]
             if magazine_meshes and magazine_track >= 0:
-                parts['magazine'] = (magazine_track, Surface(magazine_meshes))
+                parts['magazine'] = (magazine_track, Surface(magazine_meshes, reach=HOLD_REACH))
             operating_meshes = [m for m in rest['meshes'] if rigid(m) and operating_track in owners.get(m['block'], {}).get('tracks', [])
                                 and m['block'] not in magazine_blocks]
             if operating_meshes and operating_track >= 0:
-                parts['operatingPart'] = (operating_track, Surface(operating_meshes))
+                parts['operatingPart'] = (operating_track, Surface(operating_meshes, reach=HOLD_REACH))
             if parts:
                 timeline = hand_timeline(reload, clip, parts, max(2, round(reload.frames / 70)))
 
@@ -650,7 +762,7 @@ def describe(command, hands=True):
     if operating_track >= 0:
         part = [m for m in rigid_meshes if operating_track in owners.get(m['block'], {}).get('tracks', []) and m['block'] not in magazine_blocks]
         others = [m for m in rigid_meshes if m not in part and m['block'] not in magazine_blocks]
-        candidates = grab_candidates(part, others, reload.poses[operating_track][0])
+        candidates = grab_candidates(part, others, reload.poses[operating_track][0], count=5)
     ammunition = simulation.get('ammunition', {})
     rail = simulation.get('magazineRail') or {}
     items = checklist.get('items', [])
@@ -780,8 +892,7 @@ def held_contact(editor, command, side):
 
 def hold_score(report):
     """Higher is a better grip: fingers on the surface count, sunk or floating ones cost."""
-    return (len(report['touching']) - 1.5 * len(report['buried']) - 0.5 * len(report['hovering']) +
-            (0.5 if report['palm']['state'] == 'touching' else 0.0))
+    return len(report['touching']) - 1.5 * len(report['buried']) - 0.5 * len(report['hovering'])
 
 
 def best_native_hold(editor, track, hand, spans, limit=12):

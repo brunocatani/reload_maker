@@ -517,6 +517,10 @@ namespace reloadmaker
         void configureLoadout(const QJsonObject& params);
         void controlPlayback(const QJsonObject& params);
         void arrangeView(const QJsonObject& params);
+        [[nodiscard]] Vec3f weaponPointInWorld(const QJsonValue& value) const;
+        void paintViewMarks() const;
+        QJsonArray _viewMarks;
+        QJsonObject pictureSheet(const QJsonObject& params) const;
         QJsonObject renderView(const QJsonObject& params);
         QJsonObject captureWindow();
         QJsonObject simulateOperation(const QJsonObject& params);

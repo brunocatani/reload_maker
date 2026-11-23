@@ -8,12 +8,18 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QJsonArray>
 #include <QListWidget>
+#include <QMatrix4x4>
+#include <QOpenGLPaintDevice>
 #include <QPainter>
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QTimer>
 #include <QUuid>
+#include <QVector3D>
+#include <QVector4D>
+#include <algorithm>
 
 namespace reloadmaker
 {
@@ -22,6 +28,8 @@ namespace reloadmaker
 
     void ReloadMakerController::registerLoadoutCommands()
     {
+        connect(_window->getGLView(), &GLView::paintUpdate, this, [this] { paintViewMarks(); });
+
         _commands.add({ "select_weapon", CommandAccess::Edit, CommandGate::WhenIdle,
                         [this](const QJsonObject& params) -> std::optional<QJsonObject> {
                             const int index = params["index"].toInt(-1);
@@ -66,6 +74,9 @@ namespace reloadmaker
                         [this](const QJsonObject& params) -> std::optional<QJsonObject> {
                             return renderView(params);
                         } });
+
+        _commands.add({ "picture_sheet", CommandAccess::Read, CommandGate::Always,
+                        [this](const QJsonObject& params) -> std::optional<QJsonObject> { return pictureSheet(params); } });
 
         _commands.add({ "window_capture", CommandAccess::Read, CommandGate::WhenIdle,
                         [this](const QJsonObject&) -> std::optional<QJsonObject> { return captureWindow(); } });
@@ -164,6 +175,14 @@ namespace reloadmaker
         }
     }
 
+    // A weapon-local point given as three numbers, in the scene's space.
+    Vec3f ReloadMakerController::weaponPointInWorld(const QJsonValue& value) const
+    {
+        const auto p = value.toArray();
+        require(p.size() == 3 && _weaponBoneIndex >= 0 && _weaponBoneIndex < _globalPose.size(), "Expected a weapon-local point of three numbers");
+        return composed(_globalPose[_weaponBoneIndex], Transformf{ { number(p[0]), number(p[1]), number(p[2]) } }).translation;
+    }
+
     void ReloadMakerController::arrangeView(const QJsonObject& params)
     {
         auto* viewport = _window->getGLView();
@@ -172,7 +191,8 @@ namespace reloadmaker
         }
         const QString view = params["view"].toString("current");
         const QHash<QString, GLView::ViewState> views{ { "front", GLView::ViewFront }, { "back", GLView::ViewBack },
-                                                       { "side", GLView::ViewRight },  { "top", GLView::ViewTop },
+                                                       { "side", GLView::ViewRight },  { "left", GLView::ViewLeft },
+                                                       { "top", GLView::ViewTop },     { "bottom", GLView::ViewBottom },
                                                        { "iso", GLView::ViewDefault } };
         if (view != "current") {
             require(views.contains(view), "Unknown camera view");
@@ -181,14 +201,153 @@ namespace reloadmaker
                 viewport->setRotation(-65, 0, 135);
             }
         }
+        if (params.contains("rotation")) {
+            const auto angles = params["rotation"].toArray();
+            require(angles.size() == 3, "Rotation is three angles in degrees");
+            viewport->setRotation(number(angles[0]), number(angles[1]), number(angles[2]));
+        }
         if (params["fit"].toBool()) {
             require(fitWeapon(), "No weapon bounds available for Fit");
+        }
+        // Frames a region given by weapon-local points, such as a hand on its part.
+        if (params.contains("focus")) {
+            const auto points = params["focus"].toArray();
+            require(points.size() >= 2 && points.size() <= 64 && _weaponBoneIndex >= 0 && _weaponBoneIndex < _globalPose.size(),
+                    "Focus needs 2 to 64 weapon-local points and a loaded weapon");
+            QVector<QVector3D> world;
+            for (const auto value : points) {
+                const auto q = weaponPointInWorld(value);
+                world.append({ q.x, q.y, q.z });
+            }
+            require(viewport->studioFitBounds(world), "The view cannot frame these points");
         }
         if (params.contains("zoom")) {
             const float zoom = number(params["zoom"]);
             require(zoom > .05f && zoom < 20, "Zoom outside supported range");
             viewport->setZoom(zoom);
         }
+    }
+
+    // The marks of the render being captured: each is a weapon-local point shown
+    // as a coloured dot with an optional label, or a line to a second point.
+    // Drawn while the frame paints, as the other viewport overlays are, so the
+    // camera is the one the frame was drawn with; a mark behind a mesh stays visible.
+    void ReloadMakerController::paintViewMarks() const
+    {
+        if (_viewMarks.isEmpty() || _weaponBoneIndex < 0 || _weaponBoneIndex >= _globalPose.size()) {
+            return;
+        }
+        auto* view = _window->getGLView();
+        const auto camera = view->reloadMakerWorldToClip();
+        const double width = view->width(), height = view->height(), unit = height / 100.0;
+        const auto dpr = view->devicePixelRatioF();
+        const auto project = [&](const QJsonValue& value, QPointF& out) {
+            const auto p = value.toArray();
+            if (p.size() != 3) {
+                return false;
+            }
+            const auto world = composed(_globalPose[_weaponBoneIndex], Transformf{ { float(p[0].toDouble()), float(p[1].toDouble()), float(p[2].toDouble()) } }).translation;
+            const auto clip = camera * QVector4D(world.x, world.y, world.z, 1);
+            if (clip.w() <= .001f) {
+                return false;
+            }
+            out = { (clip.x() / clip.w() + 1) * width / 2, (1 - clip.y() / clip.w()) * height / 2 };
+            return true;
+        };
+        QOpenGLPaintDevice device(QSize(qRound(width * dpr), qRound(height * dpr)));
+        device.setDevicePixelRatio(dpr);
+        QPainter painter(&device);
+        painter.setRenderHint(QPainter::Antialiasing);
+        QFont font = painter.font();
+        font.setBold(true);
+        for (const auto value : _viewMarks) {
+            const auto mark = value.toObject();
+            QColor color(mark["color"].toString("#ffd371"));
+            if (!color.isValid()) {
+                color = QColor("#ffd371");
+            }
+            QPointF point;
+            if (!project(mark["point"], point)) {
+                continue;
+            }
+            if (mark.contains("to")) {
+                QPointF end;
+                if (project(mark["to"], end)) {
+                    painter.setPen(QPen(QColor(0, 0, 0, 200), unit * .9));
+                    painter.drawLine(point, end);
+                    painter.setPen(QPen(color, unit * .5));
+                    painter.drawLine(point, end);
+                    point = end;
+                }
+            }
+            const double radius = unit * std::clamp(mark["size"].toDouble(1.4), .4, 6.0);
+            painter.setPen(QPen(QColor(0, 0, 0, 230), unit * .3));
+            painter.setBrush(color);
+            painter.drawEllipse(point, radius, radius);
+            const auto label = mark["label"].toString();
+            if (!label.isEmpty()) {
+                font.setPixelSize(std::max(10, int(radius * (label.size() > 2 ? 1.5 : 1.9))));
+                painter.setFont(font);
+                // A short label sits inside its dot; a longer one beside it on a dark plate.
+                if (label.size() <= 2) {
+                    painter.setPen(color.lightness() > 140 ? Qt::black : Qt::white);
+                    painter.drawText(QRectF(point.x() - radius, point.y() - radius, radius * 2, radius * 2), Qt::AlignCenter, label);
+                } else {
+                    const auto box = painter.fontMetrics().boundingRect(label).adjusted(-4, -2, 4, 2);
+                    const QPointF origin(point.x() + radius + 4 - box.left(), point.y() + box.height() / 4.0);
+                    painter.setPen(Qt::NoPen);
+                    painter.setBrush(QColor(0, 0, 0, 190));
+                    painter.drawRect(QRectF(box).translated(origin));
+                    painter.setPen(Qt::white);
+                    painter.drawText(origin, label);
+                }
+            }
+        }
+    }
+
+    // Several saved pictures as one labelled grid, so a client compares them in a
+    // single image. Panels are scaled to a common cell width.
+    QJsonObject ReloadMakerController::pictureSheet(const QJsonObject& params) const
+    {
+        const auto panels = params["panels"].toArray();
+        require(!panels.isEmpty() && panels.size() <= 24, "A sheet holds 1 to 24 panels");
+        const int columns = std::clamp(params["columns"].toInt(2), 1, 6);
+        const int cell = std::clamp(params["cellWidth"].toInt(640), 160, 1280);
+        const int bar = cell / 12, gap = 6;
+        QVector<QImage> images;
+        int rowHeight = 0;
+        for (const auto value : panels) {
+            QImage image(value.toObject()["path"].toString());
+            require(!image.isNull(), "Cannot read panel picture " + value.toObject()["path"].toString());
+            images.append(image.scaledToWidth(cell, Qt::SmoothTransformation));
+            rowHeight = std::max(rowHeight, images.last().height());
+        }
+        const int rows = (panels.size() + columns - 1) / columns;
+        const auto title = params["title"].toString();
+        const int top = title.isEmpty() ? 0 : bar + gap;
+        QImage sheet(columns * cell + (columns + 1) * gap, top + rows * (rowHeight + bar + gap) + gap, QImage::Format_RGB32);
+        sheet.fill(QColor(24, 26, 30));
+        QPainter painter(&sheet);
+        painter.setRenderHint(QPainter::Antialiasing);
+        QFont font = painter.font();
+        font.setBold(true);
+        font.setPixelSize(bar * 7 / 10);
+        painter.setFont(font);
+        if (!title.isEmpty()) {
+            painter.setPen(Qt::white);
+            painter.drawText(QRect(gap * 2, 0, sheet.width() - gap * 4, bar + gap), Qt::AlignVCenter | Qt::AlignLeft, title);
+        }
+        for (int i = 0; i < images.size(); ++i) {
+            const int x = gap + (i % columns) * (cell + gap), y = top + gap + (i / columns) * (rowHeight + bar + gap);
+            painter.fillRect(x, y, cell, bar, QColor(255, 211, 113));
+            painter.setPen(Qt::black);
+            painter.drawText(QRect(x + gap, y, cell - gap * 2, bar), Qt::AlignVCenter | Qt::AlignLeft, panels[i].toObject()["label"].toString());
+            painter.drawImage(x, y + bar, images[i]);
+        }
+        painter.end();
+        const QString path = studioDataPath("evidence/sheet-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".png");
+        require(sheet.save(path), "Cannot save the picture sheet");
+        return { { "path", path }, { "width", sheet.width() }, { "height", sheet.height() }, { "panels", panels.size() } };
     }
 
     // Renders into the evidence folder. With preserveCamera the camera returns to
@@ -207,8 +366,26 @@ namespace reloadmaker
         const QString view = params["view"].toString("current");
         const auto captureId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         const QString path = studioDataPath("evidence/view-" + captureId + "-" + view + ".png");
-        const auto image = viewport->studioCaptureFrame();
-        require(!image.isNull() && image.save(path), "Cannot capture current native frame");
+        const auto marks = params["marks"].toArray();
+        require(marks.size() <= 256, "At most 256 marks");
+        _viewMarks = marks;
+        const auto clearMarks = qScopeGuard([&] { _viewMarks = {}; });
+        auto image = viewport->studioCaptureFrame();
+        require(!image.isNull(), "Cannot capture current native frame");
+        // The caption is a bar across the top of the picture, over the editor's own tool chips.
+        if (const auto caption = params["caption"].toString(); !caption.isEmpty()) {
+            QPainter painter(&image);
+            const double unit = image.height() / 100.0;
+            QFont font = painter.font();
+            font.setBold(true);
+            font.setPixelSize(std::max(12, int(unit * 3.6)));
+            painter.setFont(font);
+            const QRectF bar(0, 0, image.width(), unit * 8);
+            painter.fillRect(bar, QColor(20, 22, 26));
+            painter.setPen(Qt::white);
+            painter.drawText(bar.adjusted(unit, 0, -unit, 0), Qt::AlignVCenter | Qt::AlignLeft, caption);
+        }
+        require(image.save(path), "Cannot capture current native frame");
         auto result = commandStatus();
         result["captureId"] = captureId;
         result["documentRevision"] = double(_revision);

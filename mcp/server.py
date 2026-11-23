@@ -149,9 +149,10 @@ def measure_hand_contact(hand: str = '') -> dict:
     or the fit being placed in configure_magazine, is measured; a hand holding
     nothing is refused. Per finger and palm: the gap between hand surface and
     magazine surface in game units (negative is inside), with touching, hovering
-    and buried lists and a verdict. An accepted hand-authored fit reads all five
-    fingers touching with at most about 0.5 units of sinking; a fit that sinks
-    0.7 or more needs its own correction."""
+    and buried lists and a verdict. The limits come from the saved fits of the
+    authored weapons: a finger within 0.5 units is on the magazine, holds is
+    three or more fingers on it, and only skin deeper than 1.3 units is sunk;
+    fingers typically sit 0.3 to 0.7 units in and the palm usually stands clear."""
     import perception
     return perception.measure_contact(command, hand)
 
@@ -178,6 +179,121 @@ def build_weapon_atlas(output: str, plugin: str = '', limit: int = 10) -> dict:
     Changes the selected weapon; refuses while there are unsaved edits."""
     import perception
     return perception.atlas(command, output, plugin, limit)
+
+STORE = ROOT/'local/atlas'
+
+def _pictured(result: dict):
+    """The reply with its picture attached, so the caller sees the sheet without a second call."""
+    sheet = result.get('sheet')
+    return [json.dumps(result, indent=1), Image(path=sheet)] if sheet else result
+
+@mcp.tool()
+def next_step():
+    """Author the open weapon one decided step at a time: call this, do exactly
+    the one tool call it returns in do (tool and arguments), then call it
+    again. It reads what the weapon still lacks and picks the step, so there is
+    nothing to plan, order or skip. A step that needs a choice says so in then
+    and comes with a picture of numbered options. When it returns stop, do
+    nothing more on the weapon and report its reason word for word. When
+    nothing is missing and both hands measure as holding the magazine, it
+    returns finish_weapon."""
+    import guided
+    return _pictured(guided.next_step(command, STORE))
+
+@mcp.tool()
+def finish_weapon():
+    """The last call for a weapon. Checks that nothing is missing and that each
+    hand measures as holding the magazine, then saves the project and reports
+    whether the export check accepted every configuration. finished false comes
+    with the failing checks; call next_step to fix them. It never claims the
+    weapon works in the game."""
+    import guided
+    return _pictured(guided.finish(command, STORE))
+
+@mcp.tool()
+def solve_magazine_fit(hand: str):
+    """Work out how a hand (left or right) holds the selected magazine, and get
+    the candidates as one picture. Starting hands come from the fit assigned
+    now, from fits that hold on other weapons with a similar magazine, and from
+    this weapon's own reload; each is moved onto the magazine's surface by
+    measurement and then measured for real. The picture has one row per
+    candidate with three views; dots on the finger ends and palm are green
+    (touching), yellow (a gap) or red (sunk in). candidates lists the same rows
+    as numbers, best first. Nothing is saved until choose_magazine_fit."""
+    import fitting, guided
+    result = fitting.solve(command, STORE, hand)
+    guided.count(STORE, command('revision')['weapon'], 'fit-' + hand)
+    return _pictured(result)
+
+@mcp.tool()
+def choose_magazine_fit(hand: str, number: int) -> dict:
+    """Save candidate number (a row of solve_magazine_fit's picture) as this
+    magazine's fit for the hand, then hold the magazine with it in Operate and
+    return the measured contact. Row 1 is the best by measurement."""
+    import fitting
+    return fitting.choose(command, STORE, hand, number)
+
+@mcp.tool()
+def nudge_magazine_fit(hand: str, move: str, amount: str = 'small'):
+    """Move a saved magazine fit one step in plain words and see before and
+    after as one picture. move: up, down (along the magazine; up is the end
+    with the cartridges), forward (toward the muzzle), back, closer (palm onto
+    the magazine), away, twist left, twist right (around the magazine's
+    length). amount: small, medium, large. The move is kept and saved unless
+    it sank a finger or lost contact, in which case it is undone and kept is
+    false."""
+    import fitting
+    return _pictured(fitting.nudge(command, hand, move, amount))
+
+@mcp.tool()
+def show_magazine_fit():
+    """Both hands holding the magazine in Operate: the measured contact of each
+    and one picture with a row per hand, three views, and the same coloured
+    dots as solve_magazine_fit. Use it to check saved fits."""
+    import fitting
+    return _pictured(fitting.show(command))
+
+@mcp.tool()
+def show_grab_points():
+    """The exposed points of the part a hand works (charging handle, bolt handle,
+    slide) as numbered dots on the weapon, in one picture: three close views
+    and the whole weapon. Pick the dot on the handle or knob a person would
+    pull, then call choose_grab_point with its number."""
+    import guided
+    return _pictured(guided.grab_sheet(command, STORE))
+
+@mcp.tool()
+def choose_grab_point(number: int) -> dict:
+    """Add dot number from show_grab_points as a grab point of the operating part and save it."""
+    import guided
+    return guided.choose_grab(command, STORE, number)
+
+@mcp.tool()
+def author_operating_fingers() -> dict:
+    """Give the operating part its finger shape for both hands in one call: the
+    fingers of the hand that works it in the weapon's own reload, at the moment
+    they are closed on it. The wrist is not stored; it follows the player."""
+    import guided
+    return guided.operating_fingers(command)
+
+@mcp.tool()
+def prepare_magazine_models(magazine: str = '') -> dict:
+    """Prepare and cook a magazine's full and empty world models (the ones that
+    lie on the ground and sit in the hand in the game) and assign them, in one
+    call that waits for the job (about a minute). magazine is the record of one
+    of the weapon's magazines, selected first; without it the selected magazine
+    is prepared."""
+    import guided
+    return guided.magazine_models(command, STORE, magazine)
+
+@mcp.tool()
+def remember_magazine_fits() -> dict:
+    """Add the open weapon's saved magazine fits to the fit library that
+    solve_magazine_fit starts from: each hand that measures as holding is kept
+    with its finger joints, in the magazine's own frame. Run it on weapons
+    whose fits are accepted."""
+    import fitting
+    return fitting.remember_fits(command, STORE)
 
 @mcp.tool()
 def assign_model_override(model: str, path: str, expected_revision: int, operation: str = 'set') -> dict:
@@ -260,10 +376,14 @@ def set_workspace(index: int, expected_revision: int, hands_page: int | None = N
     return command('workspace',args,expected_revision)
 
 @mcp.tool()
-def render_view(view: str = 'current', fit: bool = False, zoom: float | None = None, preserve_camera: bool = False) -> Image:
-    """Return a fresh native viewport image: current/front/back/side/top/iso. Fit always references the assembled weapon. preserve_camera restores the user's camera after taking the requested inspection view."""
+def render_view(view: str = 'current', fit: bool = False, zoom: float | None = None, preserve_camera: bool = False,
+                focus: list[list[float]] | None = None, marks: list[dict] | None = None, caption: str = '') -> Image:
+    """Return a fresh native viewport image: current/front/back/side/left/top/bottom/iso. Fit always references the assembled weapon. preserve_camera restores the user's camera after taking the requested inspection view. focus frames a region given by weapon-local points instead of the whole weapon. marks draws weapon-local points over the scene, each {point[3], color '#rrggbb', label, size} and optionally to[3] for a line; caption writes a bar across the top."""
     args={'view':view,'fit':fit,'preserveCamera':preserve_camera}
     if zoom is not None: args['zoom']=zoom
+    if focus: args['focus']=focus
+    if marks: args['marks']=marks
+    if caption: args['caption']=caption
     result=command('render',args)
     return Image(path=result['path'])
 
@@ -320,9 +440,11 @@ def start_part_grip(pose_id: str, anchor: int, expected_revision: int, captured:
     return command('start_grip',{'poseId':pose_id,'anchor':anchor,'captured':captured},expected_revision)
 
 @mcp.tool()
-def set_part_grip(transform: dict, name: str, expected_revision: int) -> dict:
-    """Set hand-in-part transform: rotate[9] native row-major, translate[3], uniform scale."""
-    return command('set_grip',{'transform':transform,'name':name},expected_revision)
+def set_part_grip(transform: dict, name: str, expected_revision: int, fingers: list[dict] | None = None) -> dict:
+    """Set hand-in-part transform: rotate[9] native row-major, translate[3], uniform scale. fingers, when given, replaces the draft's fifteen finger joints (thumb to little finger, base to tip), each in the same layout relative to its parent joint."""
+    params={'transform':transform,'name':name}
+    if fingers: params['fingers']=fingers
+    return command('set_grip',params,expected_revision)
 
 @mcp.tool()
 def save_part_grip(expected_revision: int) -> dict:
@@ -827,7 +949,9 @@ if __name__=='__main__':
             if 'expected_revision' in tools[args.call].inputSchema.get('properties',{}) and 'expected_revision' not in arguments:
                 arguments['expected_revision']=command('revision')['revision']
             reply=globals()[args.call](**arguments)
-            print(reply.path if isinstance(reply,Image) else json.dumps(reply,indent=1))
+            # A reply with a picture is its text followed by the picture; here the text names the picture's file.
+            if isinstance(reply,list): reply=reply[0]
+            print(reply.path if isinstance(reply,Image) else reply if isinstance(reply,str) else json.dumps(reply,indent=1))
     elif args.command:
         request=json.loads(args.command)
         print(json.dumps(command(request['method'],request.get('params'),request.get('expectedRevision'))))

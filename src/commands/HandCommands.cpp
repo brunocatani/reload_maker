@@ -160,6 +160,15 @@ namespace reloadmaker
         auto candidate = *_partGripDraft;
         QString error;
         require(decodePoseTransform(params["transform"], candidate.pose.placement.handInAnchor, error), error);
+        // The draft's finger joints, in the saved-pose layout, for a fit whose
+        // fingers were worked out rather than captured.
+        if (params.contains("fingers")) {
+            const auto fingers = params["fingers"].toArray();
+            require(fingers.size() == kFingerJoints, "Expected all 15 finger joints");
+            for (int i = 0; i < kFingerJoints; ++i) {
+                require(decodePoseTransform(fingers[i], candidate.pose.fingers[i], error), error);
+            }
+        }
         const auto previous = _partGripDraft;
         const auto previousPreview = _handPosePreview;
         _partGripDraft = candidate;
