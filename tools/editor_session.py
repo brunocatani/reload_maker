@@ -29,6 +29,8 @@ TESTBEDS = (
     'srep-service', 'srep-ar10', 'srep-honeybadger', 'srep-xm16e1',
 )
 LIBRARY = ROOT / 'workspace/library'
+# Saved hands, fits and cooked magazine models: new files per save, so a check's own are removed with its library files.
+AUTHORED = (ROOT / 'workspace/hand-poses', ROOT / 'workspace/part-grips', ROOT / 'workspace/world-models')
 # Where each weapon was left (loadout, camera, page), written by the editor.
 SESSIONS = ROOT / 'local/sessions'
 
@@ -130,7 +132,7 @@ def snapshot(paths):
 
 
 def library_files():
-    return {path for path in LIBRARY.rglob('*') if path.is_file()} if LIBRARY.exists() else set()
+    return {path for folder in (LIBRARY,) + AUTHORED if folder.exists() for path in folder.rglob('*') if path.is_file()}
 
 
 def restore(saved, existing, keep_library=False):
@@ -152,8 +154,10 @@ def restore(saved, existing, keep_library=False):
         if path not in saved:
             path.unlink()
             restored.append(str(path))
-    if LIBRARY.exists() and not keep_library:
-        for path in sorted(LIBRARY.rglob('*'), reverse=True):
+    for folder in () if keep_library else (LIBRARY,) + AUTHORED:
+        if not folder.exists():
+            continue
+        for path in sorted(folder.rglob('*'), reverse=True):
             if path.is_file() and path not in existing:
                 path.unlink()
                 restored.append(str(path))
